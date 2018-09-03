@@ -1,0 +1,9 @@
+state\event,start,ack,"timeout
+retry > 0","timeout
+retry = 0"
+READY,"set retry
+set timer
+send\SENDING",,,
+SENDING,,clear\READY,"retry - 1
+set timer
+send\",clear\READY

@@ -1,0 +1,882 @@
+#+STARTUP: indent
+* 锁控系统
+锁控系统采用任务槽模式，最大支持 32 个任务同时运行。每个任务都有独立的
+上下文，状态机。执行时互相不干涉。新任务在执行时，先检查已有任务的 PIN，
+如果出现重复，则继续现有任务的执行，否则找到一个新的任务槽进行执行。每
+个任务都有冷却时间的概念，在冷却时间结束后，任务自动从任务槽中清除。
+** 基本系统
+*** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/lock.h
+  #ifndef __LOCK_H
+  #define __LOCK_H
+  #include <stdint.h>
+  #include "ring.h"
+  #include "defination.h"
+  #include "uart.h"
+
+  #ifdef LOCK_FC
+  #define LOCK_CMD_OFF 0x50
+  #define LOCK_CMD_STATUS 0x51
+  #else
+  #ifdef LOCK_NBSN
+  #define LOCK_CMD_OFF 0x8A
+  #define LOCK_CMD_STATUS 0x80
+  #else
+  #define LOCK_CMD_OFF 0x01
+  #define LOCK_CMD_STATUS 0x02
+  #endif
+  #endif
+
+  struct board_context {
+    uint32_t state;
+    uint32_t timer;
+    uint32_t interval;
+    uint8_t status[3];
+    uint8_t last_status[3];
+    uint32_t activated_locks;
+  };
+
+  extern uint8_t activated_boards;
+  extern struct board_context bctxs[MAX_LOCK_BOARDS];
+
+  extern struct ring_t * lock_tx;
+  extern struct ring_t * lock_rx;
+
+  void lock_setup(struct ring_t * tx, struct ring_t * rx);
+  void lock_start(void);
+  void lock_off(uint8_t board, uint8_t lock, uint16_t pin);
+
+  #ifndef ENGINEER_MODE
+  void lock_boot_scan(void);
+  void lock_multi_off(uint8_t board, uint8_t * locks, uint8_t locklen, uint16_t * pins, uint8_t pinlen);
+  #endif
+  void lock_status(uint8_t board, uint16_t pin);
+  void lock_confirm(uint8_t cmd, uint8_t board, uint8_t * data, uint8_t len);
+  void lock_eventloop(void);
+  void lock_callback(uint8_t * buf, uint32_t size);
+  uint8_t * lock_get_status(uint8_t board);
+  uint16_t lock_generate_pin(uint8_t board, uint8_t lock, int64_t ts);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/lock.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "lock.h"
+  #include "defination.h"
+  #include "console.h"
+  #include "uart.h"
+  #ifndef ENGINEER_MODE
+  #include "network.h"
+  #include "packet.h"
+  #include "utility.h"
+  #include "upstream.h"
+  #include "lockboard-fsm.h"
+  #ifdef LOCK_FC
+  #include "lock-fc-fsm.h"
+  #endif
+  #ifdef LOCK_DGZL
+  #include "lock-dgzl-fsm.h"
+  #endif
+  #else
+  #include "engineer.h"
+  #include "engineer-fsm.h"
+  #endif
+
+  #ifdef LOCK_FC
+  #define LOCK_CMD_INTERVAL 999
+  void lock_fc_off(uint8_t board, uint8_t lock);
+  void lock_fc_callback(uint8_t * buf, uint32_t size);
+  #else
+  #define LOCK_CMD_INTERVAL 499
+  void lock_dgzl_off(uint8_t board, uint8_t lock);
+  void lock_dgzl_callback(uint8_t * buf, uint32_t size);
+  #endif
+
+  #define LOCK_COOL_DOWN_INTERVAL 9999
+
+
+  struct ring_t * lock_tx;
+  struct ring_t * lock_rx;
+
+  #ifndef ENGINEER_MODE
+
+  uint8_t activated_boards;
+
+  static uint32_t activated_lock_tasks = 0;
+  <<lock-task-context>>
+
+  static struct lock_task_context tasks[32];
+  struct board_context bctxs[MAX_LOCK_BOARDS];
+
+  #endif
+
+  <<lock-setup>>
+
+  void lock_start(void) {
+  }
+
+  void lock_boot_scan(void) {
+    for (uint8_t board = 0; board < MAX_LOCK_BOARDS; board ++) {
+      bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_SCAN_EVENT, &board);
+    }
+  }
+
+  <<lock-confirm>>
+
+  #ifndef ENGINEER_MODE
+  #ifdef LOCK_FC
+  #define LOOP_INTERVAL 999 // interval of 1 second
+  #else
+  #define LOOP_INTERVAL 499 // interval of 500 microseconds
+  #endif
+  #define SCAN_INTERVAL 2999
+  static uint32_t loop_timer = 0;
+  static uint32_t scan_timer = 0;
+  #endif
+
+  <<lock-eventloop>>
+  <<lock-off>>
+
+  void lock_callback(uint8_t * buf, uint32_t size) {
+  #ifdef LOCK_FC
+    lock_fc_callback(buf, size);
+  #endif
+  #ifdef LOCK_DGZL
+    lock_dgzl_callback(buf, size);
+  #endif
+  }
+
+  uint16_t lock_generate_pin(uint8_t board, uint8_t lock, int64_t ts) {
+    return (((ts / 1000) & 63) | (board << 13) | (lock << 8) | (2 << 6)) & 0xFFFF;
+  }
+
+  #ifndef ENGINEER_MODE
+  uint8_t * lock_get_status(uint8_t board) {
+    return bctxs[board].status;
+  }
+
+  <<lockboard-fsm>>
+  <<lock-fsm>>
+  #endif
+#+end_src
+*** 配置
+#+begin_src c :noweb-ref lock-setup
+  void lock_setup(struct ring_t * tx, struct ring_t * rx) {
+
+    lock_tx = tx;
+    lock_rx = rx;
+
+  #ifndef ENGINEER_MODE
+    activated_boards = 0;
+
+    for (uint8_t i = 0; i < MAX_LOCK_BOARDS; i ++) {
+      bzero(&bctxs[i], sizeof(struct board_context));
+      bctxs[i].state = LOCKBOARD_READY_STATE;
+      bctxs[i].interval = 10 * 60 * 1000 - 1;
+      bctxs[i].timer = systick + bctxs[i].interval;
+    }
+
+    for (uint8_t i = 0; i < 32; i ++) {
+      bzero(&tasks[i], sizeof(struct lock_task_context));
+      tasks[i].state = LOCK_READY_STATE;
+    }
+  #endif
+  }
+#+end_src
+*** 主循环
+#+begin_src c :noweb-ref lock-eventloop
+  void lock_eventloop() {
+  #ifndef ENGINEER_MODE
+    if (systick > loop_timer) {
+      loop_timer = systick + LOOP_INTERVAL;
+
+      if (systick > scan_timer) { // interval of 3 seconds
+        scan_timer = systick + SCAN_INTERVAL;
+
+        for (uint8_t i = 0; i < MAX_LOCK_BOARDS; i ++) {
+          if ((activated_boards & (1 << i)) != 0) {
+            if (bctxs[i].state == LOCKBOARD_SCANNING_STATE) {
+              if (systick > bctxs[i].timer) {
+                bctxs[i].timer = systick + bctxs[i].interval;
+                bctxs[i].state = lockboard_transform_state(bctxs[i].state, LOCKBOARD_TIMEOUT_EVENT, &i);
+              } else {
+                bctxs[i].state = lockboard_transform_state(bctxs[i].state, LOCKBOARD_SCAN_TIMER_EVENT, &i);
+              }
+            }
+          }
+        }
+      }
+
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((activated_lock_tasks & (1 << i)) != 0) {
+          if (tasks[i].state == LOCK_LOCKING_OFF_STATE) {
+            if (systick > tasks[i].lockoff_timer) {
+              if (tasks[i].remaining == 0) {
+                tasks[i].state = lock_transform_state(tasks[i].state, LOCK_TIMEOUT_NEWLINE_REMAINING_EQUALS_0_EVENT, &i);
+              } else {
+                tasks[i].state = lock_transform_state(tasks[i].state, LOCK_TIMEOUT_NEWLINE_REMAINING_GREATER_THAN_0_EVENT, &i);
+              }
+            }
+          } else if (tasks[i].state == LOCK_LOCK_STATUS_STATE) {
+            if (systick > tasks[i].status_timer) {
+              tasks[i].state = lock_transform_state(tasks[i].state, LOCK_TIMEOUT_EVENT, &i);
+            }
+          } else if (tasks[i].state == LOCK_COOL_DOWN_STATE) {
+            if (systick > tasks[i].cooldown_timer) {
+              tasks[i].state = lock_transform_state(tasks[i].state, LOCK_TIMEOUT_EVENT, &i);
+            }
+          }
+        }
+      }
+    }
+  #else
+    return;
+  #endif
+  }
+#+end_src
+*** 锁板状态机
+锁板状态机用于在开锁后扫描锁控板，直到超时(十分钟)或所有的锁都锁上了。
+#+begin_src c :noweb-ref lockboard-fsm
+  void lockboard_do_action(enum LOCKBOARD_ACTION action, void * data) {
+    uint8_t idx = * ((uint8_t *) data);
+    switch (action) {
+    case LOCKBOARD_LOCK_STATUS_ACTION:
+      lock_status(idx, (uint16_t)((timestamp >> 13/* div 1024 * 8 */) | ((idx + 1) << 13) | (timestamp & 0x1f00) | (1 << 6)));
+      break;
+    case LOCKBOARD_REPORT_NEWLINE_LOCK_STATUS_ACTION: {
+      parameter_t param;
+      bzero(&param, sizeof(parameter_t));
+      param.sn = sn ++;
+      param.board = idx + 1;
+      param.states = bctxs[idx].status;
+      param.__states_len = 3;
+      param.timestamp = timestamp + 10 * 60 * 1000; // valid in 10 minutes
+      param.rssi = network_rssi;
+      param.ber = network_ber;
+      param.reply_time = network_reply_time;
+      param.ttl = network_ttl;
+      param.network_reset = (int) network_reset_times;
+      param.network_shutdown = (int) network_shutdown_times;
+      param.pin = lock_generate_pin(idx + 1, idx + 1, timestamp);
+      param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+      param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+      param.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+      param.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+      param.fireware_version |= (1 << (1 + 16));
+  #endif
+      uint8_t param_size = packet_calculate_encode_size(&param);
+      uint8_t upbuf[param_size];
+      uint8_t bufsize = packet_encode(LOCK_DATA, uid, &param, upbuf, param_size);
+      upstream_send(param.pin, upbuf, bufsize);
+
+      break;
+    }
+    }
+  }
+#+end_src
+*** 锁状态机
+#+begin_src c :noweb-ref lock-fsm
+  void lock_do_action(enum LOCK_ACTION action, void * data) {
+    uint8_t idx = * ((uint8_t *) data);
+    switch (action) {
+    case LOCK_CONFIRM_LOCK_OFF_ACTION:
+    case LOCK_CONFIRM_LOCK_OFF_NEWLINE_RETRY_EQUALS_2_NEWLINE_LOCK_OFF_FIRST_NEWLINE_SET_REMAINING_ACTION: {
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      if (tasks[idx].locks_count > 1) {
+        confirm.pin = tasks[idx].pin;
+        confirm.sn = sn ++;
+        confirm.cmd_type = LOCKS_OFF;
+        confirm.board = tasks[idx].board + 1;
+        confirm.rssi = network_rssi;
+        confirm.ber = network_ber;
+        confirm.reply_time = network_reply_time;
+        confirm.ttl = network_ttl;
+        confirm.network_reset = (int) network_reset_times;
+        confirm.network_shutdown = (int) network_shutdown_times;
+        uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+        uint8_t buf[confirm_size];
+        uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
+        network_write(buf, bufsize);
+        console_log("Confirm LOCKS_OFF ( board: ");
+        console_number(tasks[idx].board + 1);
+        console_string(", locks: ");
+        for (uint8_t i = 0; i < tasks[idx].locks_count; i ++) {
+          if ((tasks[idx].locks & (1 << i)) == 0) continue;
+          console_number(i + 1);
+          console_string(", ");
+        }
+        console_string(")\r\n");
+      } else {
+        uint8_t lock = 0;
+        for (uint8_t i = 0; i < 32; i ++) {
+          if ((tasks[idx].locks & (1 << i)) != 0) {
+            lock = i + 1;
+            break;
+          }
+        }
+        confirm.pin = tasks[idx].pin;
+        confirm.sn = sn ++;
+        confirm.cmd_type = LOCK_OFF;
+        confirm.board = tasks[idx].board + 1;
+        confirm.lock = lock;
+        confirm.rssi = network_rssi;
+        confirm.ber = network_ber;
+        confirm.reply_time = network_reply_time;
+        confirm.ttl = network_ttl;
+        confirm.network_reset = (int) network_reset_times;
+        confirm.network_shutdown = (int) network_shutdown_times;
+        uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+        uint8_t buf[confirm_size];
+        uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
+        network_write(buf, bufsize);
+        console_log("Confirm LOCK_OFF ( board: ");
+        console_number(tasks[idx].board + 1);
+        console_string(", lock: ");
+        console_number(lock);
+        console_string(")\r\n");
+      }
+
+      if (LOCK_CONFIRM_LOCK_OFF_ACTION == action) {
+        return;
+      }
+
+      tasks[idx].retry = 2;
+      for (uint8_t lock = 0; lock < 32; lock ++) {
+        if ((tasks[idx].locks & (1 << lock)) != 0) {
+  #ifdef LOCK_FC
+          lock_fc_off(tasks[idx].board, lock);
+  #endif
+  #ifdef LOCK_DGZL
+          lock_dgzl_off(tasks[idx].board, lock);
+  #endif
+          tasks[idx].lockoff_timer = systick + LOCK_CMD_INTERVAL;
+          tasks[idx].remaining = tasks[idx].locks_count - 1;
+          return;
+        }
+      }
+      break;
+    }
+    case LOCK_LOCK_OFF_NEXT_NEWLINE_REMAINING_MINUS_1_ACTION: {
+      uint8_t j = 0;
+      for (uint8_t lock = 0; lock < 32; lock ++) {
+        if ((tasks[idx].locks & (1 << lock)) != 0) {
+          if (j == (tasks[idx].locks_count - tasks[idx].remaining)) {
+  #ifdef LOCK_FC
+            lock_fc_off(tasks[idx].board, lock);
+  #endif
+  #ifdef LOCK_DGZL
+            lock_dgzl_off(tasks[idx].board, lock);
+  #endif
+            tasks[idx].remaining --;
+            tasks[idx].lockoff_timer = systick + LOCK_CMD_INTERVAL;
+            break;
+          }
+          j ++;
+        }
+      }
+      break;
+    }
+    case LOCK_LOCK_STATUS_ACTION:
+      lock_status(tasks[idx].board, tasks[idx].pin);
+      tasks[idx].status_timer = systick + LOCK_CMD_INTERVAL;
+      break;
+    case LOCK_START_COOL_DOWN_TIMER_NEWLINE_SCAN_BOARD_ACTION:
+      tasks[idx].cooldown_timer = systick + LOCK_COOL_DOWN_INTERVAL;
+      bctxs[tasks[idx].board].state = lockboard_transform_state(bctxs[tasks[idx].board].state, LOCKBOARD_SCAN_EVENT, &tasks[idx].board);
+      break;
+    case LOCK_RETRY_MINUS_1_NEWLINE_LOCK_OFF_FIRST_NEWLINE_SET_REMAINING_ACTION:
+      tasks[idx].retry --;
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((tasks[idx].locks & (1 << i)) != 0) {
+  #ifdef LOCK_FC
+          lock_fc_off(tasks[idx].board, i);
+  #endif
+  #ifdef LOCK_DGZL
+          lock_dgzl_off(tasks[idx].board, i);
+  #endif
+          tasks[idx].lockoff_timer = systick + LOCK_CMD_INTERVAL;
+          tasks[idx].remaining = tasks[idx].locks_count - 1;
+          return;
+        }
+      }
+      break;
+    case LOCK_CLEAR_TASK_ACTION:
+      activated_lock_tasks &= ~(1 << idx);
+      break;
+    }
+  }
+#+end_src
+*** 锁任务上下文
+
+| name           | type   | meaning          |
+|----------------+--------+------------------|
+| state          | uint32 | 状态机当前状态   |
+| pin            | uint16 | 任务 PIN         |
+| board          | byte   | 锁板 ID          |
+| locks          | uint32 | 锁 BITMAP        |
+| locks_count    | byte   | 锁数量           |
+| remaining      | byte   | 剩余锁数量       |
+| retry          | retry  | 任务剩余重试次数 |
+| lockoff_timer  | uint32 | 开锁命令计时器   |
+| status_timer   | uint32 | 锁状态命令计时器 |
+| cooldown_timer | uint32 | 状态机冷却计时器 |
+
+#+begin_src c :noweb-ref lock-task-context
+  struct lock_task_context {
+    uint32_t state;
+    uint16_t pin;
+    uint8_t board;
+    uint32_t locks;
+    uint8_t locks_count;
+    uint8_t remaining;
+    uint8_t retry;
+    uint32_t lockoff_timer;
+    uint32_t status_timer;
+    uint32_t cooldown_timer;
+  };
+#+end_src
+*** 开锁
+#+begin_src c :noweb-ref lock-off
+  void lock_off(uint8_t board, uint8_t lock, uint16_t pin) {
+  #ifdef ENGINEER_MODE
+    (void) pin;
+  #ifdef LOCK_FC
+    lock_fc_off(board, lock);
+  #else
+    lock_dgzl_off(board - 1, lock - 1);
+  #endif
+  #else
+
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated_lock_tasks & (1 << i)) != 0) {
+        if (tasks[i].pin == pin) {
+          console_log("Found dup command LOCK_OFF(");
+          console_number(board + 1);
+          console_string(", ");
+          console_number(lock + 1);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+
+          tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_EVENT, &i);
+
+          return;
+        }
+      }
+    }
+
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated_lock_tasks & (1 << i)) == 0) {
+        activated_lock_tasks |= (1 << i);
+        tasks[i].pin = pin;
+        tasks[i].state = LOCK_READY_STATE;
+        tasks[i].board = board;
+        tasks[i].locks = (1 << lock);
+        tasks[i].locks_count = 1;
+        tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_EVENT, &i);
+        bctxs[board].activated_locks = (1 << lock);
+        break;
+      }
+    }
+  #endif
+  }
+
+  #ifndef ENGINEER_MODE
+  void lock_multi_off(uint8_t board, uint8_t * locks, uint8_t locklen, uint16_t * pins, uint8_t pinlen) {
+    (void) pinlen;
+
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated_lock_tasks & (1 << i)) != 0) {
+        if (tasks[i].pin == pins[0]) {
+          console_log("Found dup command LOCKS_OFF(");
+          console_number(board + 1);
+          console_string(", ");
+  #ifdef DEBUG
+          for (uint8_t j = 0; j < locklen; j ++) {
+            console_number(locks[j] + 1);
+            console_string(", ");
+          }
+  #endif
+          console_number(pins[0]);
+          console_string(")\r\n");
+          tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_EVENT, &i);
+
+          return;
+        }
+      }
+    }
+
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated_lock_tasks & (1 << i)) == 0) {
+        activated_lock_tasks |= (1 << i);
+        tasks[i].pin = pins[0];
+        tasks[i].state = LOCK_READY_STATE;
+        tasks[i].board = board;
+        tasks[i].locks = 0;
+        for (uint8_t j = 0; j < locklen; j ++) {
+          uint8_t lock = locks[j];
+          tasks[i].locks |= (1 << lock);
+          bctxs[board].activated_locks = (1 << lock);
+        }
+        tasks[i].locks_count = locklen;
+        tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_EVENT, &i);
+        break;
+      }
+    }
+  }
+  #endif
+#+end_src
+*** 锁板响应
+#+begin_src c :noweb-ref lock-confirm
+  void lock_confirm(uint8_t cmd, uint8_t board, uint8_t * data, uint8_t len) {
+    (void)len;
+  #ifdef ENGINEER_MODE
+    switch (cmd) {
+    case LOCK_CMD_OFF:
+      break;
+    case LOCK_CMD_STATUS:
+      if (board < MAX_BOARD) {
+        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_LESS_THAN_MAX_EVENT, data);
+      } else {
+        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_EQUALS_MAX_EVENT, data);
+      }
+      break;
+    default:
+      break;
+    }
+  #else
+    switch (cmd) {
+  #ifdef LOCK_DGZL
+    case LOCK_CMD_OFF: {
+      console_log("Confirm lock off\r\n");
+      uint8_t lock = * (uint8_t *) data;
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((activated_lock_tasks & (1 << i)) != 0) {
+          if (tasks[i].board == board) {
+            for (uint8_t j = 0; j < 32; j ++) {
+              if ((tasks[i].locks & (1 << j)) != 0 && j == lock) {
+                if (tasks[i].remaining == 0) {
+                  tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_ACK_NEWLINE_REMAINING_EQUALS_0_EVENT, &i);
+                } else {
+                  tasks[i].state = lock_transform_state(tasks[i].state, LOCK_LOCK_OFF_ACK_NEWLINE_REMAINING_GREATER_THAN_0_EVENT, &i);
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+      break;
+    }
+  #endif
+    case LOCK_CMD_STATUS:
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((activated_lock_tasks & (1 << i)) != 0) {
+          if (tasks[i].board == board) {
+            uint8_t opened = 0;
+            for (uint8_t lock = 0; lock < 32; lock ++) {
+              if ((tasks[i].locks & (1 << lock)) == 0) {
+                continue;
+              }
+  #ifdef LOCK_FC
+              if (lock < 8) {
+                if ((data[0] & (1 << (lock - 0))) != 0) {
+                  opened ++;
+                }
+              } else if (lock < 16) {
+                if ((data[1] & (1 << (lock - 8))) != 0) {
+                  opened ++;
+                }
+              } else if (lock < 24) {
+                if ((data[2] & (1 << (lock - 16))) != 0) {
+                  opened ++;
+                }
+              } else {
+              }
+  #endif
+  #ifdef LOCK_DGZL
+              if (lock < 8) {
+                if ((data[2] & (1 << (lock - 0))) == 0) {
+                  opened ++;
+                }
+              } else if (lock < 16) {
+                if ((data[1] & (1 << (lock - 8))) == 0) {
+                  opened ++;
+                }
+              } else if (lock < 24) {
+                if ((data[0] & (1 << (lock - 16))) == 0) {
+                  opened ++;
+                }
+              } else {
+              }
+  #endif
+            }
+            if (opened == tasks[i].locks_count) {
+              tasks[i].state = lock_transform_state(tasks[i].state, LOCK_STATUS_ACK_NEWLINE_LOCK_OPENED_EVENT, &i);
+            } else {
+
+  #ifdef LOCK_FC
+              if (tasks[i].remaining == 0) {
+                if (tasks[i].retry == 0) {
+                  tasks[i].state = lock_transform_state(tasks[i].state, LOCK_STATUS_ACK_NEWLINE_LOCK_NOT_OPENED_NEWLINE_REMAINING_EQUALS_0_NEWLINE_RETRY_EQUALS_0_EVENT, &i);
+                } else {
+                  tasks[i].state = lock_transform_state(tasks[i].state, LOCK_STATUS_ACK_NEWLINE_LOCK_NOT_OPENED_NEWLINE_REMAINING_EQUALS_0_NEWLINE_RETRY_GREATER_THAN_0_EVENT, &i);
+                }
+              }
+  #endif
+
+
+  #ifdef LOCK_DGZL
+              if (tasks[i].retry == 0) {
+                tasks[i].state = lock_transform_state(tasks[i].state, LOCK_STATUS_ACK_NEWLINE_LOCK_NOT_OPENED_NEWLINE_RETRY_EQUALS_0_EVENT, &i);
+              } else {
+                tasks[i].state = lock_transform_state(tasks[i].state, LOCK_STATUS_ACK_NEWLINE_LOCK_NOT_OPENED_NEWLINE_RETRY_GREATER_THAN_0_EVENT, &i);
+              }
+  #endif
+            }
+          }
+        }
+      }
+
+      if (bctxs[board].state == LOCKBOARD_SCANNING_STATE) {
+        if (bctxs[board].status[0] != data[0] || bctxs[board].status[1] != data[1] || bctxs[board].status[2] != data[2]) {
+          bctxs[board].status[0] = data[0];
+          bctxs[board].status[1] = data[1];
+          bctxs[board].status[2] = data[2];
+          bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_STATUS_ACK_COMMA_CHANGED_EVENT, &board);
+        }
+        uint8_t locks_count = 0;
+        uint8_t closed = 0;
+        for (uint8_t lock = 0; lock < 32; lock ++) {
+          if ((bctxs[board].activated_locks & (1 << lock)) != 0) {
+            locks_count ++;
+  #ifdef LOCK_FC
+            if (lock < 8) {
+              if ((data[0] & (1 << (lock - 0))) == 0) {
+                closed ++;
+              }
+            } else if (lock < 16) {
+              if ((data[1] & (1 << (lock - 8))) == 0) {
+                closed ++;
+              }
+            } else if (lock < 24) {
+              if ((data[2] & (1 << (lock - 16))) == 0) {
+                closed ++;
+              }
+            } else {
+            }
+  #endif
+  #ifdef LOCK_DGZL
+            if (lock < 8) {
+              if ((data[2] & (1 << (lock - 0))) != 0) {
+                closed ++;
+              }
+            } else if (lock < 16) {
+              if ((data[1] & (1 << (lock - 8))) != 0) {
+                closed ++;
+              }
+            } else if (lock < 24) {
+              if ((data[0] & (1 << (lock - 16))) != 0) {
+                closed ++;
+              }
+            } else {
+            }
+  #endif
+          }
+        }
+        if (locks_count == closed) {
+          bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_STATUS_ACK_COMMA_CLOSED_EVENT, &board);
+        }
+      }
+      break;
+    }
+  #endif
+  }
+#+end_src
+** 东莞中立
+*** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/lock-dgzl.c
+  #include <libopencm3/stm32/usart.h>
+  #include "lock.h"
+  #include "console.h"
+  #include "utility.h"
+  #include "packet.h"
+  #include "uart.h"
+  #ifndef ENGINEER_MODE
+  #include "lockboard-fsm.h"
+  #endif
+
+  void lock_dgzl_off(uint8_t board, uint8_t lock);
+  void lock_dgzl_callback(uint8_t * buf, uint32_t size);
+
+  <<dgzl-cmd>>
+  <<dgzl-lock-off>>
+  <<dgzl-status>>
+  <<dgzl-callback>>
+
+#+end_src
+*** 锁板指令
+#+begin_src c :noweb-ref dgzl-cmd
+  static void lock_cmd(uint8_t * cmd) {
+    cmd[7] = cmd[2] ^ cmd[3] ^ cmd[4] ^ cmd[5] ^ cmd[6];
+    ring_write_array(lock_tx, cmd, 0, 9);
+  }
+#+end_src
+*** 锁板回调
+#+begin_src c :noweb-ref dgzl-callback
+  void lock_dgzl_callback(uint8_t * buf, uint32_t size) {
+    if (size == 6) {
+      uint8_t xor = buf[0] ^ buf[1] ^ buf[2] ^ buf[3] ^ buf[4];
+      if (xor == buf[5]) {
+        // it's correct
+        uint8_t board = buf[0] - 1;
+        uint8_t cmd = buf[1];
+
+  #ifndef ENGINEER_MODE
+        activated_boards |= (1 << board);
+  #endif
+        switch (cmd) {
+        case LOCK_CMD_OFF: {
+          uint8_t lock = buf[4] - 1;
+          lock_confirm(cmd, board, &lock, 1);
+          break;
+        }
+        case LOCK_CMD_STATUS: {
+  #ifdef ENGINEER_MODE
+          lock_confirm(cmd, board, buf + 2, 3);
+  #else
+          lock_confirm(cmd, board, buf + 2, 3);
+  #endif
+          break;
+        }
+        default:
+          console_log("Unknown lock cmd ");
+          console_number(cmd);
+          console_newline();
+          break;
+        }
+      } else {
+        // it's incorrect
+        console_log("Invalid response from lock board: ");
+        for (int i = 0; i < 6; i ++) {
+          console_byte(buf[i]);
+          console_string(" ");
+        }
+        console_newline();
+      }
+    }
+  }
+#+end_src
+*** 开锁
+#+begin_src c :noweb-ref dgzl-lock-off
+  void lock_dgzl_off(uint8_t board, uint8_t lock) {
+    uint8_t cmd[9] = { 0x08, 0xAA, board + 1, 0x01, 0x00, 0x00, lock + 1, 0x00, 0x55 };
+    lock_cmd(cmd);
+  #ifndef ENGINEER_MODE
+    bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_LOCK_OFF_EVENT, &board);
+  #endif
+  }
+#+end_src
+*** 锁状态
+#+begin_src c :noweb-ref dgzl-status
+  void lock_status(uint8_t board, uint16_t pin) {
+    (void)pin;
+  #ifdef ENGINEER_MODE
+    board --;
+  #endif
+    uint8_t cmd[9] = { 0x08, 0xAA, board + 1, 0x02, 0x00, 0x00, 0x00, 0x00, 0x55 };
+    lock_cmd(cmd);
+  }
+#+end_src
+** 蜂巢
+系统内的锁板 ID 和锁 ID 都从 0 开始计数。蜂巢锁板的锁也是从 0 开始计数，
+因此在发送开锁指令和接收锁板响应时，锁板要加一，而锁 ID 不变。
+*** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/lock-fc.c
+  #include <libopencm3/stm32/usart.h>
+  #include "lock.h"
+  #include "console.h"
+  #include "utility.h"
+  #include "packet.h"
+  #include "uart.h"
+  #include "hash.h"
+  #ifndef ENGINEER_MODE
+  #include "lockboard-fsm.h"
+  #endif
+
+  void lock_fc_off(uint8_t board, uint8_t lock);
+  void lock_fc_callback(uint8_t * buf, uint32_t size);
+
+  <<fc-cmd>>
+  <<fc-lock-off>>
+  <<fc-callback>>
+  <<fc-status>>
+#+end_src
+*** 锁板指令
+#+begin_src c :noweb-ref fc-cmd
+  static void lock_cmd(uint8_t * cmd, uint32_t size) {
+    cmd[size - 1] = crc8_maxim(cmd + 1, size - 2);
+    ring_write_array(lock_tx, cmd, 0, size);
+  }
+#+end_src
+*** 锁板回调
+#+begin_src c :noweb-ref fc-callback
+  void lock_fc_callback(uint8_t * buf, uint32_t size) {
+    uint8_t base = 0xED; // { 0xAA, 0xFF}
+    if (buf[size - 1] != crc8_maxim_update(base, buf, size - 1)) {
+      // invalid packet
+      return;
+    }
+
+    uint8_t board = buf[1] - 1;
+    uint8_t cmd = buf[2];
+
+  #ifndef ENGINEER_MODE
+    activated_boards |= 1 << board;
+  #endif
+
+    switch (cmd) {
+    case LOCK_CMD_OFF: {
+      lock_confirm(cmd, board, buf + 3, 3);
+      break;
+    }
+    case LOCK_CMD_STATUS: {
+      lock_confirm(cmd, board, buf + 3, 3);
+      break;
+    }
+    default:
+      console_log("Unknown lock cmd ");
+      console_number(cmd);
+      console_newline();
+      break;
+    }
+  }
+#+end_src
+*** 开锁
+#+begin_src c :noweb-ref fc-lock-off
+  void lock_fc_off(uint8_t board, uint8_t lock) {
+    uint8_t cmd[8] = { 0x07, 0xAA, 0x55, 0x03, board + 1, 0x50, lock, 0x00 };
+    lock_cmd(cmd, 8);
+  #ifndef ENGINEER_MODE
+    bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_LOCK_OFF_EVENT, &board);
+  #endif
+  }
+#+end_src
+*** 锁状态
+#+begin_src c :noweb-ref fc-status
+  void lock_status(uint8_t board, uint16_t pin) {
+    (void)pin;
+    uint8_t cmd[7] = { 0x06, 0xAA, 0x55, 0x02, board + 1, 0x51, 0x00 };
+    lock_cmd(cmd, 7);
+  }
+#+end_src

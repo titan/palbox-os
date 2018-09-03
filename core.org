@@ -1,0 +1,2688 @@
+#+STARTUP: indent
+* 核心系统
+** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/boxos.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/dbgmcu.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/stm32/iwdg.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/stm32/f1/bkp.h>
+  #include <libopencm3/stm32/pwr.h>
+  #include <libopencm3/cm3/systick.h>
+  #include "defination.h"
+  #include "ring.h"
+  #include "lock.h"
+  #include "console.h"
+  #include "light.h"
+  #include "ultraviolet.h"
+  #include "utility.h"
+  #include "led.h"
+  #include "uart.h"
+  #include "uart3.h"
+  #include "uart4.h"
+  #ifndef ENGINEER_MODE
+  #include "network.h"
+  #include "camera.h"
+  #include "packet.h"
+  #include "base64.h"
+  #include "charger.h"
+  #include "fan.h"
+  #include "card-reader.h"
+  #include "upstream.h"
+  #include "egg.h"
+  #else
+  #include "engineer.h"
+  #endif
+
+  #define sync_timestamp(result) do {                     \
+      if (result->parameter.timestamp > MIN_TIMESTAMP) {  \
+        timestamp = result->parameter.timestamp;          \
+        zone = result->parameter.zone;                    \
+        PWR_CR |= PWR_CR_DBP;                             \
+        BKP_DR1 = timestamp;                              \
+        BKP_DR2 = (timestamp >> 32);                      \
+        PWR_CR &= ~PWR_CR_DBP;                            \
+      }                                                   \
+    } while (0)
+
+  volatile uint32_t sn = 0;
+  volatile int64_t timestamp = 0;
+  volatile int64_t zone = 0;
+  volatile uint32_t reboot_start = 0;
+  volatile uint32_t systick = 0;
+  uint32_t randkey[4];
+  uint8_t * uid = (uint8_t *)randkey;
+
+
+  /*
+    Pin layout:
+
+            +-+-+-+-+-+-+-+-+
+    byte 0  |x|x|x|x|x|x|x|x|   high byte of pin
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |x|x|x|x|x|x|x|x|   low byte of pin
+            +-+-+-+-+-+-+-+-+
+
+   ,*/
+
+  struct ring_t cmdpins;
+
+  #define PIN_BUFFER_BITSIZE 2
+
+  uint8_t pins_buffer[2 << (PIN_BUFFER_BITSIZE)];
+  struct uart_context_t uart3_context;
+  struct uart_context_t uart4_context;
+
+  void sys_tick_handler(void);
+
+  void sys_tick_handler(void) {
+    systick ++;
+    timestamp ++;
+  }
+
+  <<setup>>
+  <<mainloop>>
+  #ifndef ENGINEER_MODE
+  <<network-callback>>
+  <<online-notification>>
+  #endif
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  static void setup(void) {
+    ring_init(&cmdpins, pins_buffer, PIN_BUFFER_BITSIZE);
+  #ifndef ENGINEER_MODE
+    uart3_context.eventloop = uart3_eventloop;
+    uart3_context.setup = uart3_setup;
+
+    uart_init(3, &uart3_context);
+  #endif
+
+    uart4_context.eventloop = uart4_eventloop;
+    uart4_context.setup = uart4_setup;
+    uart4_context.start = uart4_start;
+
+    uart_init(4, &uart4_context);
+
+    rcc_clock_setup_in_hse_8mhz_out_72mhz();
+    rcc_periph_clock_enable(RCC_AFIO);
+    rcc_peripheral_enable_clock(&RCC_APB1ENR, RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN);
+    gpio_primary_remap(AFIO_MAPR_SWJ_CFG_JTAG_OFF_SW_ON, AFIO_MAPR_USART3_REMAP_NO_REMAP);
+
+    uint64_t restored_timestamp = BKP_DR1 | (((uint64_t) BKP_DR2) << 32);
+
+    if (restored_timestamp > MIN_TIMESTAMP) {
+      timestamp = (int64_t) restored_timestamp;
+    }
+  #ifdef DEBUG
+    console_setup();
+  #endif
+    uart_setup();
+  #ifndef ENGINEER_MODE
+    network_setup();
+    camera_setup();
+    fan_setup();
+    upstream_setup();
+  #endif
+    light_setup();
+    ultraviolet_setup();
+    led_setup();
+
+    systick = 0;
+
+    /* 72MHz / 8 => 9,000,000 counts per second */
+    systick_set_clocksource(STK_CSR_CLKSOURCE_AHB_DIV8);
+
+    /* 9,000,000/9,000 = 1000 overflows per second - every 1 ms one interrupt */
+    /* SysTick interrupt every N clock pulses: set reload to N-1 */
+    systick_set_reload(8999);
+    systick_interrupt_enable();
+
+    systick_counter_enable();
+
+    randkey[0] = *(uint32_t*)(0x1ffff7e8);
+    randkey[1] = *(uint32_t*)(0x1ffff7ec);
+    randkey[2] = *(uint32_t*)(0x1ffff7f0);
+
+    iwdg_set_period_ms(30000);
+    iwdg_start();
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref mainloop
+  int main(void) {
+
+    setup();
+    console_string("boxos start\r\n");
+    for (int i = 0; i < 12; i ++) {
+      console_byte((uint8_t)*(((uint8_t *)randkey) + i));
+      console_string(" ");
+    }
+    console_newline();
+  #ifdef ENGINEER_MODE
+    engineer_mainloop();
+  #else
+
+    reboot_start = systick;
+    uint32_t loop_timer = systick;
+    uart_start();
+    network_start();
+
+    while (1) {
+      if (systick - loop_timer > 999) { // interval of one second
+        loop_timer = systick;
+        if (timestamp > MIN_TIMESTAMP || (systick - reboot_start < 10 * 60 * 1000 )) {
+          iwdg_reset();
+        } else {
+          console_log("Stopping to feed watch dog\r\n");
+        }
+        if (ultraviolet_start_at != 0 && ((timestamp - ultraviolet_start_at) >> 10) > 30 * 60) {
+          ultraviolet_off();
+        }
+      }
+      network_eventloop();
+      upstream_eventloop();
+
+      uart_eventloop();
+    }
+  #endif
+
+    return 0;
+  }
+#+end_src
+** 网络回调
+#+begin_src c :noweb-ref network-callback
+  void network_read_callback(uint8_t * buf, uint32_t len) {
+    uint8_t dlen = base64_decode_length(buf, len);
+    reboot_start = systick; // set reboot timer to 0
+    if (dlen <= 0) {
+      console_string("base64 decode length failed\r\n");
+      return;
+    }
+    uint8_t dbuf[dlen];
+    if (base64_decode(buf, len, dbuf, dlen) == 0) {
+      console_log("base64 decode failed\r\n");
+      return;
+    }
+    uint8_t size = packet_estimate_decode_size(dbuf, (uint8_t)dlen);
+    if (size == 0) {
+      console_log("packet decode length failed(crc error)\r\n");
+      return;
+    }
+    uint8_t newbuf[size];
+    bzero(newbuf, size);
+    uint8_t resultbuf[size];
+    bzero(resultbuf, size);
+    packet_result_t * result = (packet_result_t *) resultbuf;
+    cmd_type_t cmdtype = packet_decode(dbuf, dlen, newbuf, result);
+    sync_timestamp(result);
+    switch (cmdtype) {
+    case PING: {
+      console_log("PING\r\n");
+      parameter_t param;
+      bzero(&param, sizeof(parameter_t));
+      param.sn = sn ++;
+      param.rssi = network_rssi;
+      param.ber = network_ber;
+      param.reply_time = network_reply_time;
+      param.ttl = network_ttl;
+      param.network_reset = (int) network_reset_times;
+      param.network_shutdown = (int) network_shutdown_times;
+      uint8_t param_size = packet_calculate_encode_size(&param);
+      uint8_t ackbuf[param_size];
+      uint8_t bufsize = packet_encode(PONG, uid, &param, ackbuf, param_size);
+      network_write(ackbuf, bufsize);
+      break;
+    }
+    case PONG:
+      console_log("PONG\r\n");
+      break;
+    case CONFIRM:
+      console_log("CONFIRM of ");
+      if (result->parameter.cmd_type == LOCK_DATA) {
+        console_string("LOCK_DATA\r\n");
+        upstream_ack(result->parameter.pin);
+      } else if (result->parameter.cmd_type == LOCK_OFF) {
+        console_string("LOCK_OFF\r\n");
+        upstream_ack(result->parameter.pin);
+      } else if (result->parameter.cmd_type == EGG_FALLEN) {
+        console_string("EGG_FALLEN\r\n");
+        upstream_ack(result->parameter.pin);
+      } else if (result->parameter.cmd_type == EGG_TIMEOUT) {
+        console_string("EGG_TIMEOUT\r\n");
+        upstream_ack(result->parameter.pin);
+      } else {
+        console_number(result->parameter.cmd_type);
+        console_newline();
+      }
+      break;
+    case LOCK_OFF:
+      console_log("LOCK_OFF(board: ");
+      console_number(result->parameter.board);
+      console_string(", lock: ");
+      console_number(result->parameter.lock);
+      console_string(", pin: ");
+      console_number(result->parameter.pin);
+      console_string(")\r\n");
+      lock_off(result->parameter.board - 1, result->parameter.lock - 1, result->parameter.pin);
+      break;
+    case LOCKS_OFF:
+      console_log("LOCKS_OFF(board: ");
+      console_number(result->parameter.board);
+      console_string(", locks: [");
+      for (uint8_t i = 0; i < result->parameter.__locks_len; i ++) {
+        console_number(result->parameter.locks[i]);
+        result->parameter.locks[i] --;
+        console_string(" ");
+      }
+      console_string("], pins: [");
+      for (uint8_t i = 0; i < result->parameter.__pins_len; i ++) {
+        console_number(result->parameter.pins[i]);
+        console_string(" ");
+      }
+      console_string("])\r\n");
+      lock_multi_off(result->parameter.board - 1, result->parameter.locks, result->parameter.__locks_len, (result->parameter.pin == 0)? (uint16_t *)result->parameter.pins: ((uint16_t *) &result->parameter.pin), (result->parameter.pin == 0)? result->parameter.__pins_len: 1);
+      break;
+    case LOCK_STATUS: {
+      console_log("LOCK_STATUS(board: ");
+      console_number(result->parameter.board);
+      console_string(")\r\n");
+
+      //lock_status(result->parameter.board, result->parameter.pin);
+
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = LOCK_STATUS;
+      confirm.board = result->parameter.board;
+      confirm.states = lock_get_status(result->parameter.board - 1);
+      confirm.__states_len = 3;
+      confirm.pin = result->parameter.pin;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.reply_time = network_reply_time;
+      confirm.ttl = network_ttl;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ackbuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ackbuf, confirm_size);
+      network_write(ackbuf, bufsize);
+      break;
+    }
+    case LOCK_DETECT:
+      console_log("LOCK_DETECT\r\n");
+      // do nothing
+      break;
+    case LOCK_STATUS_DETECT:
+      console_log("LOCK_STATUS_DETECT\r\n");
+      // do nothing
+      break;
+    case LIGHT_ON:
+      console_log("LIGHT_ON\r\n");
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        light_on();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        light_confirm(LIGHT_ON, result->parameter.pin);
+      } else {
+        console_string("Too many request for light with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        light_confirm(LIGHT_ON, result->parameter.pin);
+      }
+      break;
+    case LIGHT_OFF:
+      console_log("LIGHT_OFF\r\n");
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        light_off();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        light_confirm(LIGHT_OFF, result->parameter.pin);
+      } else {
+        console_string("Too many request for light with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        light_confirm(LIGHT_OFF, result->parameter.pin);
+      }
+      break;
+    case FAN_ON:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("FAN_ON\r\n");
+        fan_on();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        fan_confirm(FAN_ON, result->parameter.pin);
+      } else {
+        console_log("Too many request for fan with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        fan_confirm(FAN_ON, result->parameter.pin);
+      }
+      break;
+    case FAN_OFF:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("FAN_OFF\r\n");
+        fan_off();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        fan_confirm(FAN_OFF, result->parameter.pin);
+      } else {
+        console_log("Too many request for fan with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        fan_confirm(FAN_OFF, result->parameter.pin);
+      }
+      break;
+    case ULTRAVIOLET_ON:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("ULTRAVIOLET_ON\r\n");
+        ultraviolet_on();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        ultraviolet_confirm(ULTRAVIOLET_ON, result->parameter.pin);
+      } else {
+        console_log("Too many request for ultraviolet with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        ultraviolet_confirm(ULTRAVIOLET_ON, result->parameter.pin);
+      }
+      break;
+    case ULTRAVIOLET_OFF:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("ULTRAVIOLET_OFF\r\n");
+        ultraviolet_off();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        ultraviolet_confirm(ULTRAVIOLET_OFF, result->parameter.pin);
+      } else {
+        console_log("Too many request for ultraviolet with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        ultraviolet_confirm(ULTRAVIOLET_OFF, result->parameter.pin);
+      }
+      break;
+    case CAMERA_ON:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("CAMERA_ON\r\n");
+        camera_on();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        camera_confirm(CAMERA_ON, result->parameter.pin);
+      } else {
+        console_log("Too many request for camera with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        camera_confirm(CAMERA_ON, result->parameter.pin);
+      }
+      break;
+    case CAMERA_OFF:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("CAMERA_OFF\r\n");
+        camera_off();
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+        camera_confirm(CAMERA_OFF, result->parameter.pin);
+      } else {
+        console_log("Too many request for camera with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+        camera_confirm(CAMERA_OFF, result->parameter.pin);
+      }
+      break;
+    case CHARGER_STATUS:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("CHARGER_STATUS\r\n");
+        charger_status(result->parameter.board, result->parameter.pin);
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+      } else {
+        console_log("Too many request for charger with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+      }
+      break;
+    case CHARGER_CONFIG:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("CHARGER_CONFIG\r\n");
+        charger_config(result->parameter.board, result->parameter.pin);
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+      } else {
+        console_log("Too many request for charger with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+      }
+      break;
+    case CONFIG_CHARGER:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("CONFIG_CHARGER\r\n");
+        charger_config_exclamation_marks(result->parameter.board, result->parameter.enable_charging, result->parameter.enable_heating, result->parameter.pin);
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+      } else {
+        console_log("Too many request for charger with pin ");
+        console_number(result->parameter.pin);
+        console_newline();
+      }
+      break;
+    case PLAY:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("PLAY to reader ");
+        console_number(result->parameter.card_reader);
+        console_string(", audio: ");
+        console_number(result->parameter.audio);
+        console_newline();
+        card_reader_play(result->parameter.card_reader, result->parameter.audio);
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+      } else {
+        console_log("Too many request for speaker with pin ");
+        console_number((uint16_t)result->parameter.pin);
+        console_newline();
+      }
+      card_reader_confirm_play(result->parameter.card_reader, result->parameter.audio, result->parameter.pin);
+      break;
+    case VOLUME:
+      if (ring_find(&cmdpins, (uint8_t *) & (result->parameter.pin), sizeof(uint16_t), NULL) == -1) {
+        console_log("VOLUME to reader ");
+        console_number(result->parameter.card_reader);
+        console_string(", volume: ");
+        console_number(result->parameter.volume);
+        console_newline();
+        card_reader_volume(result->parameter.card_reader, result->parameter.volume);
+        while (ring_available(&cmdpins) < sizeof(uint16_t)) {
+          ring_pop(&cmdpins, sizeof(uint16_t));
+        }
+        ring_write_array(&cmdpins, (uint8_t *) & (result->parameter.pin), 0, sizeof(uint16_t));
+      } else {
+        console_log("Too many request for speaker with pin ");
+        console_number((uint16_t)result->parameter.pin);
+        console_newline();
+      }
+      card_reader_confirm_volume(result->parameter.card_reader, result->parameter.volume, result->parameter.pin);
+      break;
+    case CONFIG_NETWORK:
+      console_log("CONFIG_NETWORK(heart-rate: ");
+      console_number(result->parameter.network_heart_rate);
+      console_string(", timeout: ");
+      console_number(result->parameter.network_timeout);
+      console_string(")\r\n");
+      network_heart_rate = (uint32_t)result->parameter.network_heart_rate;
+      network_timeout = (uint32_t)result->parameter.network_timeout;
+      network_config_confirm(result->parameter.pin);
+      break;
+    case EGG_LOCK_ON:
+      console_log("EGG_LOCK_ON(egg: ");
+      console_number(result->parameter.board);
+      console_string(", cabin: ");
+      console_number(result->parameter.lock);
+      console_string(")\r\n");
+      egg_lock_on(result->parameter.board, result->parameter.lock, result->parameter.pin);
+      break;
+    case EGG_LOCK_OFF:
+      console_log("EGG_LOCK_OFF(egg: ");
+      console_number(result->parameter.board);
+      console_string(", cabin: ");
+      console_number(result->parameter.lock);
+      console_string(")\r\n");
+      egg_lock_off(result->parameter.board, result->parameter.lock, result->parameter.pin);
+      break;
+    case EGG_PLAY:
+      console_log("EGG_PLAY(egg: ");
+      console_number(result->parameter.board);
+      console_string(", audio: ");
+      console_number(result->parameter.audio);
+      console_string(")\r\n");
+      egg_play(result->parameter.board, result->parameter.audio, result->parameter.pin);
+      break;
+    case EGG_VOLUME:
+      console_log("EGG_VOLUME(egg: ");
+      console_number(result->parameter.board);
+      console_string(", volume: ");
+      console_number(result->parameter.volume);
+      console_string(")\r\n");
+      egg_volume(result->parameter.board, result->parameter.volume, result->parameter.pin);
+      break;
+    case EGG_GPIO:
+      console_log("EGG_GPIO(egg: ");
+      console_number(result->parameter.board);
+      console_string(", gpio: ");
+      console_number(result->parameter.gpio);
+      console_string(")\r\n");
+      egg_gpio(result->parameter.board, result->parameter.gpio, result->parameter.pin);
+      break;
+    case EGG_QUERY:
+      console_log("EGG_QUERY(egg: ");
+      console_number(result->parameter.board);
+      console_string(", cabin: ");
+      console_number(result->parameter.lock);
+      console_string(")\r\n");
+      egg_query(result->parameter.board, result->parameter.lock, result->parameter.pin);
+      break;
+    default:
+      break;
+    }
+  }
+#+end_src
+** 网络上线通知
+#+begin_src c :noweb-ref online-notification
+  void network_notify_connected() {
+    lock_boot_scan();
+    charger_boot_scan();
+    egg_volume(0x0F, 25, 0);
+    card_reader_volume(0x0F, 25);
+  }
+#+end_src
+** 网络协议
+*** 数据封包
+#+begin_src c :tangle /dev/shm/boxos/packet.h
+  #ifndef __PACKET_H
+  #define __PACKET_H
+  #include <stdint.h>
+  #include "parameter.h"
+
+  typedef enum CMD_TYPE {
+    UNKNOWN = 0x00,
+    PING = 0x01,
+    PONG = 0x02,
+    CONFIRM = 0x03,
+    LOCK_OFF = 0x04,
+    LOCKS_OFF = 0x05,
+    LOCK_STATUS = 0x06,
+    LOCK_DETECT = 0x07,
+    LOCK_STATUS_DETECT = 0x08,
+    CHARGER_STATUS = 0x09,
+    LIGHT_ON = 0x0A,
+    LIGHT_OFF = 0x0B,
+    FAN_ON = 0x0C,
+    FAN_OFF = 0x0D,
+    ULTRAVIOLET_ON = 0x0E,
+    ULTRAVIOLET_OFF = 0x0F,
+    CAMERA_ON = 0x10,
+    CAMERA_OFF = 0x11,
+    LOCK_DATA = 0x12,
+    PLAY = 0x13,
+    VOLUME_UP = 0x14,
+    VOLUME_DOWN = 0x15,
+    CONFIG_NETWORK = 0x16,
+    VOLUME = 0x17,
+    CHARGER_CONFIG = 0x18,
+    CONFIG_CHARGER = 0x19,
+    EGG_LOCK_ON = 0x1A,
+    EGG_LOCK_OFF= 0x1B,
+    EGG_PLAY = 0x1C,
+    EGG_GPIO = 0x1D,
+    EGG_FALLEN = 0x1E,
+    EGG_VOLUME = 0x1F,
+    EGG_TIMEOUT = 0x20,
+    EGG_QUERY = 0x21,
+  } cmd_type_t;
+
+  typedef struct {
+    cmd_type_t type;
+    uint8_t uid[12];
+    parameter_t parameter;
+  } packet_result_t;
+
+  uint8_t packet_calculate_encode_size(parameter_t * param);
+  uint8_t packet_encode(enum CMD_TYPE type, uint8_t * mac, parameter_t * param, uint8_t * buf, uint8_t size);
+
+  uint8_t packet_estimate_decode_size(uint8_t * buf, uint8_t size);
+  cmd_type_t packet_decode(uint8_t * buf, uint8_t size, uint8_t * newbuf, packet_result_t * result);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/packet.c
+  #include "packet.h"
+  #include "hash.h"
+
+  #define HEADER_SIZE (1 + 1 + 1 + 12) // len + checksum + type + uid
+
+  uint8_t packet_calculate_encode_size(parameter_t * param) {
+    param->version = APIVERSION;
+    return parameter_calculate_size(param) + HEADER_SIZE;
+  }
+
+  uint8_t packet_encode(enum CMD_TYPE type, uint8_t * uid, parameter_t * param, uint8_t * buf, uint8_t size) {
+    param->version = APIVERSION;
+    int newsize = parameter_encode_zeropack(param, buf + HEADER_SIZE, size - HEADER_SIZE);
+    buf[0] = newsize + HEADER_SIZE;
+    buf[2] = type;
+    buf[3] = uid[0];
+    buf[4] = uid[1];
+    buf[5] = uid[2];
+    buf[6] = uid[3];
+    buf[7] = uid[4];
+    buf[8] = uid[5];
+    buf[9] = uid[6];
+    buf[10] = uid[7];
+    buf[11] = uid[8];
+    buf[12] = uid[9];
+    buf[13] = uid[10];
+    buf[14] = uid[11];
+    buf[1] = crc8(buf + 2, newsize + HEADER_SIZE - 2);
+    return newsize + HEADER_SIZE;
+  }
+
+  uint8_t packet_estimate_decode_size(uint8_t * buf, uint8_t size) {
+    uint8_t crc = crc8(buf + 2, size - 2);
+    if (buf[1] != crc) {
+      // invalid packet
+      return 0;
+    }
+    return parameter_estimate_zeropack_size(buf + HEADER_SIZE, size - HEADER_SIZE) + HEADER_SIZE;
+  }
+
+  cmd_type_t packet_decode(uint8_t * buf, uint8_t size, uint8_t * newbuf, packet_result_t * result) {
+    result->uid[0] = buf[3];
+    result->uid[1] = buf[4];
+    result->uid[2] = buf[5];
+    result->uid[3] = buf[6];
+    result->uid[4] = buf[7];
+    result->uid[5] = buf[8];
+    result->uid[6] = buf[9];
+    result->uid[7] = buf[10];
+    result->uid[8] = buf[11];
+    result->uid[9] = buf[12];
+    result->uid[10] = buf[13];
+    result->uid[11] = buf[14];
+    parameter_decode_zeropack(buf + HEADER_SIZE, size - HEADER_SIZE, newbuf, &result->parameter);
+    result->type = (cmd_type_t)buf[2];
+    return (cmd_type_t)buf[2];
+  }
+#+end_src
+*** 参数定义
+#+begin_src c :tangle /dev/shm/boxos/parameter.h
+  #ifndef _PARAMETER_H
+  #define _PARAMETER_H
+  #include <stdint.h>
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+    typedef struct parameter parameter_t;
+    struct parameter {
+      int32_t sn;
+      uint8_t version;
+      int16_t pin;
+      uint8_t rssi;
+      uint8_t ber;
+      int32_t zone;
+      int64_t timestamp;
+      uint8_t board;
+      uint8_t lock;
+      uint8_t * states;
+      int __states_len;
+      uint8_t cmd_type;
+      uint8_t * chargers;
+      int __chargers_len;
+      uint8_t * locks;
+      int __locks_len;
+      int16_t * pins;
+      int __pins_len;
+      int16_t temperature;
+      int32_t card_no;
+      uint8_t card_reader;
+      int16_t audio;
+      int16_t reply_time;
+      uint8_t ttl;
+      int32_t network_reset;
+      int32_t network_shutdown;
+      int32_t network_heart_rate;
+      int32_t network_timeout;
+      uint8_t volume;
+      uint8_t charger_plugged;
+      uint8_t charger_charging;
+      uint8_t charger_full;
+      uint8_t charger_heating;
+      uint8_t * batteries;
+      int __batteries_len;
+      int64_t errno;
+      uint8_t enable_charging;
+      uint8_t enable_heating;
+      int32_t door;
+      uint8_t gpio;
+      uint8_t busy;
+      int64_t fireware_version;
+    };
+    int parameter_calculate_size(parameter_t *);
+    int parameter_encode(parameter_t *, uint8_t *);
+    int parameter_estimate_size(uint8_t *);
+    int parameter_decode(uint8_t *, parameter_t *);
+  #ifdef ZEROPACK_PARAMETER_ENABLED
+    int parameter_encode_zeropack(parameter_t *, uint8_t *, int);
+    int parameter_estimate_zeropack_size(uint8_t *, int);
+    int parameter_decode_zeropack(uint8_t *, int, uint8_t *, parameter_t *);
+  #endif
+    static inline void parameter_set_batteries(parameter_t * parameter, uint8_t * batteries, int len) {
+      parameter->batteries = batteries;
+      parameter->__batteries_len = len;
+    }
+    static inline void parameter_set_pins(parameter_t * parameter, int16_t * pins, int len) {
+      parameter->pins = pins;
+      parameter->__pins_len = len;
+    }
+    static inline void parameter_set_locks(parameter_t * parameter, uint8_t * locks, int len) {
+      parameter->locks = locks;
+      parameter->__locks_len = len;
+    }
+    static inline void parameter_set_chargers(parameter_t * parameter, uint8_t * chargers, int len) {
+      parameter->chargers = chargers;
+      parameter->__chargers_len = len;
+    }
+    static inline void parameter_set_states(parameter_t * parameter, uint8_t * states, int len) {
+      parameter->states = states;
+      parameter->__states_len = len;
+    }
+    static inline int parameter_get_batteries_len(parameter_t * parameter) {
+      return parameter->__batteries_len;
+    }
+    static inline int parameter_get_pins_len(parameter_t * parameter) {
+      return parameter->__pins_len;
+    }
+    static inline int parameter_get_locks_len(parameter_t * parameter) {
+      return parameter->__locks_len;
+    }
+    static inline int parameter_get_chargers_len(parameter_t * parameter) {
+      return parameter->__chargers_len;
+    }
+    static inline int parameter_get_states_len(parameter_t * parameter) {
+      return parameter->__states_len;
+    }
+  #ifdef __cplusplus
+  }
+  #endif
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/parameter.c
+  #include <stdlib.h>
+  #include <string.h>
+  #ifdef ZEROPACK_PARAMETER_ENABLED
+  #include "zeropack.h"
+  #endif
+  #include "tightrope.h"
+  #include "parameter.h"
+  int parameter_calculate_size(parameter_t * parameter) {
+    int size = 2;
+    short tags[37];
+    int len = 0;
+    if (parameter->sn != 0) {
+      tags[len ++] = 0;
+      if (parameter->sn > 0 && parameter->sn < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->version != 0) {
+      tags[len ++] = 1;
+      if (parameter->version > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->pin != 0) {
+      tags[len ++] = 2;
+      if (parameter->pin > 0 && parameter->pin < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (parameter->rssi != 0) {
+      tags[len ++] = 3;
+      if (parameter->rssi > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->ber != 0) {
+      tags[len ++] = 4;
+      if (parameter->ber > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->zone != 0) {
+      tags[len ++] = 5;
+      if (parameter->zone > 0 && parameter->zone < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->timestamp != 0) {
+      tags[len ++] = 6;
+      if (parameter->timestamp > 0 && parameter->timestamp < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 8;
+      }
+    }
+    if (parameter->board != 0) {
+      tags[len ++] = 7;
+      if (parameter->board > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->lock != 0) {
+      tags[len ++] = 8;
+      if (parameter->lock > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->states != NULL) {
+      tags[len ++] = 9;
+      size += 2 + 4 + parameter->__states_len * 1;
+    }
+    if (parameter->cmd_type != 0) {
+      tags[len ++] = 10;
+      if (parameter->cmd_type > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->chargers != NULL) {
+      tags[len ++] = 11;
+      size += 2 + 4 + parameter->__chargers_len * 1;
+    }
+    if (parameter->locks != NULL) {
+      tags[len ++] = 12;
+      size += 2 + 4 + parameter->__locks_len * 1;
+    }
+    if (parameter->pins != NULL) {
+      tags[len ++] = 13;
+      size += 2 + 4 + parameter->__pins_len * 2;
+    }
+    if (parameter->temperature != 0) {
+      tags[len ++] = 14;
+      if (parameter->temperature > 0 && parameter->temperature < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (parameter->card_no != 0) {
+      tags[len ++] = 15;
+      if (parameter->card_no > 0 && parameter->card_no < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->card_reader != 0) {
+      tags[len ++] = 16;
+      if (parameter->card_reader > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->audio != 0) {
+      tags[len ++] = 17;
+      if (parameter->audio > 0 && parameter->audio < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (parameter->reply_time != 0) {
+      tags[len ++] = 18;
+      if (parameter->reply_time > 0 && parameter->reply_time < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (parameter->ttl != 0) {
+      tags[len ++] = 19;
+      if (parameter->ttl > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->network_reset != 0) {
+      tags[len ++] = 20;
+      if (parameter->network_reset > 0 && parameter->network_reset < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->network_shutdown != 0) {
+      tags[len ++] = 21;
+      if (parameter->network_shutdown > 0 && parameter->network_shutdown < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->network_heart_rate != 0) {
+      tags[len ++] = 22;
+      if (parameter->network_heart_rate > 0 && parameter->network_heart_rate < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->network_timeout != 0) {
+      tags[len ++] = 23;
+      if (parameter->network_timeout > 0 && parameter->network_timeout < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->volume != 0) {
+      tags[len ++] = 24;
+      if (parameter->volume > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->charger_plugged != 0) {
+      tags[len ++] = 25;
+      if (parameter->charger_plugged > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->charger_charging != 0) {
+      tags[len ++] = 26;
+      if (parameter->charger_charging > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->charger_full != 0) {
+      tags[len ++] = 27;
+      if (parameter->charger_full > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->charger_heating != 0) {
+      tags[len ++] = 28;
+      if (parameter->charger_heating > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->batteries != NULL) {
+      tags[len ++] = 29;
+      size += 2 + 4 + parameter->__batteries_len * 1;
+    }
+    if (parameter->errno != 0) {
+      tags[len ++] = 30;
+      if (parameter->errno > 0 && parameter->errno < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 8;
+      }
+    }
+    if (parameter->enable_charging != 0) {
+      tags[len ++] = 31;
+      if (parameter->enable_charging > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->enable_heating != 0) {
+      tags[len ++] = 32;
+      if (parameter->enable_heating > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->door != 0) {
+      tags[len ++] = 33;
+      if (parameter->door > 0 && parameter->door < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (parameter->gpio != 0) {
+      tags[len ++] = 34;
+      if (parameter->gpio > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->busy != 0) {
+      tags[len ++] = 35;
+      if (parameter->busy > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (parameter->fireware_version != 0) {
+      tags[len ++] = 36;
+      if (parameter->fireware_version > 0 && parameter->fireware_version < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 8;
+      }
+    }
+    if (len > 0) {
+      if (tags[0] != 0) {
+        size += 2;
+      }
+      for (int i = 1; i < len; i ++) {
+        if (tags[i - 1] + 1 != tags[i]) size += 2;
+      }
+    }
+    return size;
+  }
+  static int parameter_set__fields(parameter_t * parameter, uint8_t * buf, short * dtags, int * dlen) {
+    int ptr = 2;
+    short count = 0;
+    for (short tag = 0, nexttag = 0; nexttag < 37; nexttag ++) {
+      switch (nexttag) {
+      case 0:
+        if (parameter->sn != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->sn > 0 && parameter->sn < 16383) {
+            short t = (short) ((parameter->sn + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 0;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 1:
+        if (parameter->version != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->version > 0) {
+            short t = (short) ((parameter->version + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 1;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 2:
+        if (parameter->pin != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->pin > 0 && parameter->pin < 16383) {
+            short t = (short) ((parameter->pin + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 2;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 3:
+        if (parameter->rssi != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->rssi > 0) {
+            short t = (short) ((parameter->rssi + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 3;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 4:
+        if (parameter->ber != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->ber > 0) {
+            short t = (short) ((parameter->ber + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 4;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 5:
+        if (parameter->zone != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->zone > 0 && parameter->zone < 16383) {
+            short t = (short) ((parameter->zone + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 5;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 6:
+        if (parameter->timestamp != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->timestamp > 0 && parameter->timestamp < 16383) {
+            short t = (short) ((parameter->timestamp + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 6;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 7:
+        if (parameter->board != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->board > 0) {
+            short t = (short) ((parameter->board + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 7;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 8:
+        if (parameter->lock != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->lock > 0) {
+            short t = (short) ((parameter->lock + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 8;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 9:
+        if (parameter->states != NULL) {
+          dtags[* dlen] = 9;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 10:
+        if (parameter->cmd_type != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->cmd_type > 0) {
+            short t = (short) ((parameter->cmd_type + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 10;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 11:
+        if (parameter->chargers != NULL) {
+          dtags[* dlen] = 11;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 12:
+        if (parameter->locks != NULL) {
+          dtags[* dlen] = 12;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 13:
+        if (parameter->pins != NULL) {
+          dtags[* dlen] = 13;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 14:
+        if (parameter->temperature != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->temperature > 0 && parameter->temperature < 16383) {
+            short t = (short) ((parameter->temperature + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 14;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 15:
+        if (parameter->card_no != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->card_no > 0 && parameter->card_no < 16383) {
+            short t = (short) ((parameter->card_no + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 15;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 16:
+        if (parameter->card_reader != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->card_reader > 0) {
+            short t = (short) ((parameter->card_reader + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 16;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 17:
+        if (parameter->audio != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->audio > 0 && parameter->audio < 16383) {
+            short t = (short) ((parameter->audio + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 17;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 18:
+        if (parameter->reply_time != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->reply_time > 0 && parameter->reply_time < 16383) {
+            short t = (short) ((parameter->reply_time + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 18;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 19:
+        if (parameter->ttl != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->ttl > 0) {
+            short t = (short) ((parameter->ttl + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 19;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 20:
+        if (parameter->network_reset != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->network_reset > 0 && parameter->network_reset < 16383) {
+            short t = (short) ((parameter->network_reset + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 20;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 21:
+        if (parameter->network_shutdown != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->network_shutdown > 0 && parameter->network_shutdown < 16383) {
+            short t = (short) ((parameter->network_shutdown + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 21;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 22:
+        if (parameter->network_heart_rate != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->network_heart_rate > 0 && parameter->network_heart_rate < 16383) {
+            short t = (short) ((parameter->network_heart_rate + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 22;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 23:
+        if (parameter->network_timeout != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->network_timeout > 0 && parameter->network_timeout < 16383) {
+            short t = (short) ((parameter->network_timeout + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 23;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 24:
+        if (parameter->volume != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->volume > 0) {
+            short t = (short) ((parameter->volume + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 24;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 25:
+        if (parameter->charger_plugged != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->charger_plugged > 0) {
+            short t = (short) ((parameter->charger_plugged + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 25;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 26:
+        if (parameter->charger_charging != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->charger_charging > 0) {
+            short t = (short) ((parameter->charger_charging + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 26;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 27:
+        if (parameter->charger_full != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->charger_full > 0) {
+            short t = (short) ((parameter->charger_full + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 27;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 28:
+        if (parameter->charger_heating != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->charger_heating > 0) {
+            short t = (short) ((parameter->charger_heating + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 28;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 29:
+        if (parameter->batteries != NULL) {
+          dtags[* dlen] = 29;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 30:
+        if (parameter->errno != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->errno > 0 && parameter->errno < 16383) {
+            short t = (short) ((parameter->errno + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 30;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 31:
+        if (parameter->enable_charging != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->enable_charging > 0) {
+            short t = (short) ((parameter->enable_charging + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 31;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 32:
+        if (parameter->enable_heating != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->enable_heating > 0) {
+            short t = (short) ((parameter->enable_heating + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 32;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 33:
+        if (parameter->door != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->door > 0 && parameter->door < 16383) {
+            short t = (short) ((parameter->door + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 33;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 34:
+        if (parameter->gpio != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->gpio > 0) {
+            short t = (short) ((parameter->gpio + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 34;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 35:
+        if (parameter->busy != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->busy > 0) {
+            short t = (short) ((parameter->busy + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 35;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 36:
+        if (parameter->fireware_version != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (parameter->fireware_version > 0 && parameter->fireware_version < 16383) {
+            short t = (short) ((parameter->fireware_version + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 36;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      default:
+        break;
+      }
+    }
+    buf[0] = SHORT0(count);
+    buf[1] = SHORT1(count);
+    return ptr;
+  }
+  static int parameter_set__data(parameter_t * parameter, uint8_t * buf, short * dtags, int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->sn);
+        buf[ptr ++] = INT1(parameter->sn);
+        buf[ptr ++] = INT2(parameter->sn);
+        buf[ptr ++] = INT3(parameter->sn);
+        break;
+      }
+      case 1: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->version;
+        break;
+      }
+      case 2: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(parameter->pin);
+        buf[ptr ++] = SHORT1(parameter->pin);
+        break;
+      }
+      case 3: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->rssi;
+        break;
+      }
+      case 4: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->ber;
+        break;
+      }
+      case 5: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->zone);
+        buf[ptr ++] = INT1(parameter->zone);
+        buf[ptr ++] = INT2(parameter->zone);
+        buf[ptr ++] = INT3(parameter->zone);
+        break;
+      }
+      case 6: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 8;
+        buf[ptr ++] = LONG0(parameter->timestamp);
+        buf[ptr ++] = LONG1(parameter->timestamp);
+        buf[ptr ++] = LONG2(parameter->timestamp);
+        buf[ptr ++] = LONG3(parameter->timestamp);
+        buf[ptr ++] = LONG4(parameter->timestamp);
+        buf[ptr ++] = LONG5(parameter->timestamp);
+        buf[ptr ++] = LONG6(parameter->timestamp);
+        buf[ptr ++] = LONG7(parameter->timestamp);
+        break;
+      }
+      case 7: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->board;
+        break;
+      }
+      case 8: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->lock;
+        break;
+      }
+      case 9: {
+        int size = parameter->__states_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < parameter->__states_len; j ++) {
+          buf[ptr ++] = parameter->states[j];
+        }
+        break;
+      }
+      case 10: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->cmd_type;
+        break;
+      }
+      case 11: {
+        int size = parameter->__chargers_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < parameter->__chargers_len; j ++) {
+          buf[ptr ++] = parameter->chargers[j];
+        }
+        break;
+      }
+      case 12: {
+        int size = parameter->__locks_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < parameter->__locks_len; j ++) {
+          buf[ptr ++] = parameter->locks[j];
+        }
+        break;
+      }
+      case 13: {
+        int size = parameter->__pins_len * 2;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < parameter->__pins_len; j ++) {
+          buf[ptr ++] = SHORT0(parameter->pins[j]);
+          buf[ptr ++] = SHORT1(parameter->pins[j]);
+        }
+        break;
+      }
+      case 14: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(parameter->temperature);
+        buf[ptr ++] = SHORT1(parameter->temperature);
+        break;
+      }
+      case 15: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->card_no);
+        buf[ptr ++] = INT1(parameter->card_no);
+        buf[ptr ++] = INT2(parameter->card_no);
+        buf[ptr ++] = INT3(parameter->card_no);
+        break;
+      }
+      case 16: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->card_reader;
+        break;
+      }
+      case 17: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(parameter->audio);
+        buf[ptr ++] = SHORT1(parameter->audio);
+        break;
+      }
+      case 18: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(parameter->reply_time);
+        buf[ptr ++] = SHORT1(parameter->reply_time);
+        break;
+      }
+      case 19: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->ttl;
+        break;
+      }
+      case 20: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->network_reset);
+        buf[ptr ++] = INT1(parameter->network_reset);
+        buf[ptr ++] = INT2(parameter->network_reset);
+        buf[ptr ++] = INT3(parameter->network_reset);
+        break;
+      }
+      case 21: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->network_shutdown);
+        buf[ptr ++] = INT1(parameter->network_shutdown);
+        buf[ptr ++] = INT2(parameter->network_shutdown);
+        buf[ptr ++] = INT3(parameter->network_shutdown);
+        break;
+      }
+      case 22: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->network_heart_rate);
+        buf[ptr ++] = INT1(parameter->network_heart_rate);
+        buf[ptr ++] = INT2(parameter->network_heart_rate);
+        buf[ptr ++] = INT3(parameter->network_heart_rate);
+        break;
+      }
+      case 23: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->network_timeout);
+        buf[ptr ++] = INT1(parameter->network_timeout);
+        buf[ptr ++] = INT2(parameter->network_timeout);
+        buf[ptr ++] = INT3(parameter->network_timeout);
+        break;
+      }
+      case 24: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->volume;
+        break;
+      }
+      case 25: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->charger_plugged;
+        break;
+      }
+      case 26: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->charger_charging;
+        break;
+      }
+      case 27: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->charger_full;
+        break;
+      }
+      case 28: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->charger_heating;
+        break;
+      }
+      case 29: {
+        int size = parameter->__batteries_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < parameter->__batteries_len; j ++) {
+          buf[ptr ++] = parameter->batteries[j];
+        }
+        break;
+      }
+      case 30: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 8;
+        buf[ptr ++] = LONG0(parameter->errno);
+        buf[ptr ++] = LONG1(parameter->errno);
+        buf[ptr ++] = LONG2(parameter->errno);
+        buf[ptr ++] = LONG3(parameter->errno);
+        buf[ptr ++] = LONG4(parameter->errno);
+        buf[ptr ++] = LONG5(parameter->errno);
+        buf[ptr ++] = LONG6(parameter->errno);
+        buf[ptr ++] = LONG7(parameter->errno);
+        break;
+      }
+      case 31: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->enable_charging;
+        break;
+      }
+      case 32: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->enable_heating;
+        break;
+      }
+      case 33: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(parameter->door);
+        buf[ptr ++] = INT1(parameter->door);
+        buf[ptr ++] = INT2(parameter->door);
+        buf[ptr ++] = INT3(parameter->door);
+        break;
+      }
+      case 34: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->gpio;
+        break;
+      }
+      case 35: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = parameter->busy;
+        break;
+      }
+      case 36: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 8;
+        buf[ptr ++] = LONG0(parameter->fireware_version);
+        buf[ptr ++] = LONG1(parameter->fireware_version);
+        buf[ptr ++] = LONG2(parameter->fireware_version);
+        buf[ptr ++] = LONG3(parameter->fireware_version);
+        buf[ptr ++] = LONG4(parameter->fireware_version);
+        buf[ptr ++] = LONG5(parameter->fireware_version);
+        buf[ptr ++] = LONG6(parameter->fireware_version);
+        buf[ptr ++] = LONG7(parameter->fireware_version);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return ptr;
+  }
+  int parameter_encode(parameter_t * parameter, uint8_t * buf) {
+    short dtags[37];
+    int dlen = 0;
+    int ptr0 = parameter_set__fields(parameter, buf, dtags, &dlen);
+    int ptr1 = parameter_set__data(parameter, buf + ptr0, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_PARAMETER_ENABLED
+  int parameter_encode_zeropack(parameter_t * parameter, uint8_t * buf, int len) {
+    uint8_t obuf[len];
+    int size = parameter_encode(parameter, obuf);
+    return zeropack(obuf, size, buf);
+  }
+  #endif
+  int parameter_estimate_size(uint8_t * buf) {
+    int ptr = 0;
+    short tag = 0;
+    short dtags[37];
+    int dlen = 0;
+    int size = sizeof(parameter_t);
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[dlen ++] = tag;
+        tag ++;
+      } else {
+        tag ++;
+      }
+    }
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 1: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 2: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 3: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 4: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 5: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 6: {
+        ptr += 4 + 8;
+        break;
+      }
+      case 7: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 8: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 9: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 10: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 11: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 12: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 13: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 14: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 15: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 16: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 17: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 18: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 19: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 20: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 21: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 22: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 23: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 24: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 25: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 26: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 27: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 28: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 29: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 30: {
+        ptr += 4 + 8;
+        break;
+      }
+      case 31: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 32: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 33: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 34: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 35: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 36: {
+        ptr += 4 + 8;
+        break;
+      }
+      default: {
+        int s = INT(buf + ptr);
+        ptr += 4 + s;
+        break;
+      }
+      }
+    }
+    return size;
+  }
+  #ifdef ZEROPACK_PARAMETER_ENABLED
+  int parameter_estimate_zeropack_size(uint8_t * buf, int len) {
+    uint8_t factor = buf[0];
+    uint8_t uzpbuf[len * factor];
+    unzeropack(buf, len, uzpbuf);
+    return parameter_estimate_size(uzpbuf);
+  }
+  #endif
+  static int parameter_parse_fields(uint8_t * buf, parameter_t * parameter, short * dtags, int * dlen) {
+    int ptr = 0;
+    short tag = 0;
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[* dlen] = tag;
+        (* dlen) ++;
+        tag ++;
+      } else if (tag == 0) {
+        tag ++;
+        parameter->sn = (value >> 1) - 1;
+      } else if (tag == 1) {
+        tag ++;
+        parameter->version = (value >> 1) - 1;
+      } else if (tag == 2) {
+        tag ++;
+        parameter->pin = (value >> 1) - 1;
+      } else if (tag == 3) {
+        tag ++;
+        parameter->rssi = (value >> 1) - 1;
+      } else if (tag == 4) {
+        tag ++;
+        parameter->ber = (value >> 1) - 1;
+      } else if (tag == 5) {
+        tag ++;
+        parameter->zone = (value >> 1) - 1;
+      } else if (tag == 6) {
+        tag ++;
+        parameter->timestamp = (value >> 1) - 1;
+      } else if (tag == 7) {
+        tag ++;
+        parameter->board = (value >> 1) - 1;
+      } else if (tag == 8) {
+        tag ++;
+        parameter->lock = (value >> 1) - 1;
+      } else if (tag == 10) {
+        tag ++;
+        parameter->cmd_type = (value >> 1) - 1;
+      } else if (tag == 14) {
+        tag ++;
+        parameter->temperature = (value >> 1) - 1;
+      } else if (tag == 15) {
+        tag ++;
+        parameter->card_no = (value >> 1) - 1;
+      } else if (tag == 16) {
+        tag ++;
+        parameter->card_reader = (value >> 1) - 1;
+      } else if (tag == 17) {
+        tag ++;
+        parameter->audio = (value >> 1) - 1;
+      } else if (tag == 18) {
+        tag ++;
+        parameter->reply_time = (value >> 1) - 1;
+      } else if (tag == 19) {
+        tag ++;
+        parameter->ttl = (value >> 1) - 1;
+      } else if (tag == 20) {
+        tag ++;
+        parameter->network_reset = (value >> 1) - 1;
+      } else if (tag == 21) {
+        tag ++;
+        parameter->network_shutdown = (value >> 1) - 1;
+      } else if (tag == 22) {
+        tag ++;
+        parameter->network_heart_rate = (value >> 1) - 1;
+      } else if (tag == 23) {
+        tag ++;
+        parameter->network_timeout = (value >> 1) - 1;
+      } else if (tag == 24) {
+        tag ++;
+        parameter->volume = (value >> 1) - 1;
+      } else if (tag == 25) {
+        tag ++;
+        parameter->charger_plugged = (value >> 1) - 1;
+      } else if (tag == 26) {
+        tag ++;
+        parameter->charger_charging = (value >> 1) - 1;
+      } else if (tag == 27) {
+        tag ++;
+        parameter->charger_full = (value >> 1) - 1;
+      } else if (tag == 28) {
+        tag ++;
+        parameter->charger_heating = (value >> 1) - 1;
+      } else if (tag == 30) {
+        tag ++;
+        parameter->errno = (value >> 1) - 1;
+      } else if (tag == 31) {
+        tag ++;
+        parameter->enable_charging = (value >> 1) - 1;
+      } else if (tag == 32) {
+        tag ++;
+        parameter->enable_heating = (value >> 1) - 1;
+      } else if (tag == 33) {
+        tag ++;
+        parameter->door = (value >> 1) - 1;
+      } else if (tag == 34) {
+        tag ++;
+        parameter->gpio = (value >> 1) - 1;
+      } else if (tag == 35) {
+        tag ++;
+        parameter->busy = (value >> 1) - 1;
+      } else if (tag == 36) {
+        tag ++;
+        parameter->fireware_version = (value >> 1) - 1;
+      } else {
+        tag ++;
+      }
+    }
+    return ptr;
+  }
+  static int parameter_parse_data(uint8_t * buf, parameter_t * parameter, short * dtags, const int dlen) {
+    int ptr = 0;
+    int sptr = sizeof(parameter_t);
+    uint8_t * addr = (uint8_t *)parameter;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4;
+        parameter->sn = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 1: {
+        ptr += 4;
+        parameter->version = buf[ptr ++];
+        break;
+      }
+      case 2: {
+        ptr += 4;
+        parameter->pin = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 3: {
+        ptr += 4;
+        parameter->rssi = buf[ptr ++];
+        break;
+      }
+      case 4: {
+        ptr += 4;
+        parameter->ber = buf[ptr ++];
+        break;
+      }
+      case 5: {
+        ptr += 4;
+        parameter->zone = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 6: {
+        ptr += 4;
+        parameter->timestamp = LONG(buf + ptr);
+        ptr += 8;
+        break;
+      }
+      case 7: {
+        ptr += 4;
+        parameter->board = buf[ptr ++];
+        break;
+      }
+      case 8: {
+        ptr += 4;
+        parameter->lock = buf[ptr ++];
+        break;
+      }
+      case 9: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        parameter->__states_len = size;
+        parameter->states = (uint8_t *)(addr + sptr);
+        memcpy(parameter->states, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      case 10: {
+        ptr += 4;
+        parameter->cmd_type = buf[ptr ++];
+        break;
+      }
+      case 11: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        parameter->__chargers_len = size;
+        parameter->chargers = (uint8_t *)(addr + sptr);
+        memcpy(parameter->chargers, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      case 12: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        parameter->__locks_len = size;
+        parameter->locks = (uint8_t *)(addr + sptr);
+        memcpy(parameter->locks, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      case 13: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        parameter->__pins_len = size / 2;
+        parameter->pins = (int16_t *)(addr + sptr);
+        for (int j = 0, len = size / 2; j < len; j ++) {
+          parameter->pins[j] = SHORT(buf + ptr);
+          ptr += 2;
+        }
+        sptr += size;
+        break;
+      }
+      case 14: {
+        ptr += 4;
+        parameter->temperature = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 15: {
+        ptr += 4;
+        parameter->card_no = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 16: {
+        ptr += 4;
+        parameter->card_reader = buf[ptr ++];
+        break;
+      }
+      case 17: {
+        ptr += 4;
+        parameter->audio = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 18: {
+        ptr += 4;
+        parameter->reply_time = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 19: {
+        ptr += 4;
+        parameter->ttl = buf[ptr ++];
+        break;
+      }
+      case 20: {
+        ptr += 4;
+        parameter->network_reset = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 21: {
+        ptr += 4;
+        parameter->network_shutdown = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 22: {
+        ptr += 4;
+        parameter->network_heart_rate = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 23: {
+        ptr += 4;
+        parameter->network_timeout = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 24: {
+        ptr += 4;
+        parameter->volume = buf[ptr ++];
+        break;
+      }
+      case 25: {
+        ptr += 4;
+        parameter->charger_plugged = buf[ptr ++];
+        break;
+      }
+      case 26: {
+        ptr += 4;
+        parameter->charger_charging = buf[ptr ++];
+        break;
+      }
+      case 27: {
+        ptr += 4;
+        parameter->charger_full = buf[ptr ++];
+        break;
+      }
+      case 28: {
+        ptr += 4;
+        parameter->charger_heating = buf[ptr ++];
+        break;
+      }
+      case 29: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        parameter->__batteries_len = size;
+        parameter->batteries = (uint8_t *)(addr + sptr);
+        memcpy(parameter->batteries, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      case 30: {
+        ptr += 4;
+        parameter->errno = LONG(buf + ptr);
+        ptr += 8;
+        break;
+      }
+      case 31: {
+        ptr += 4;
+        parameter->enable_charging = buf[ptr ++];
+        break;
+      }
+      case 32: {
+        ptr += 4;
+        parameter->enable_heating = buf[ptr ++];
+        break;
+      }
+      case 33: {
+        ptr += 4;
+        parameter->door = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 34: {
+        ptr += 4;
+        parameter->gpio = buf[ptr ++];
+        break;
+      }
+      case 35: {
+        ptr += 4;
+        parameter->busy = buf[ptr ++];
+        break;
+      }
+      case 36: {
+        ptr += 4;
+        parameter->fireware_version = LONG(buf + ptr);
+        ptr += 8;
+        break;
+      }
+      default: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        ptr += size;
+        break;
+      }
+      }
+    }
+    return ptr;
+  }
+  int parameter_decode(uint8_t * buf, parameter_t * parameter) {
+    short dtags[37];
+    int dlen = 0;
+    int ptr0 = parameter_parse_fields(buf, parameter, dtags, &dlen);
+    int ptr1 = parameter_parse_data(buf + ptr0, parameter, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_PARAMETER_ENABLED
+  int parameter_decode_zeropack(uint8_t * buf, int len, uint8_t * uzpbuf, parameter_t * parameter) {
+    unzeropack(buf, len, uzpbuf);
+    return parameter_decode(uzpbuf, parameter);
+  }
+  #endif
+#+end_src

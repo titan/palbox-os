@@ -1,0 +1,30 @@
+state\event,"lock off","status ack
+lock opened","status ack
+lock not opened
+remaing > 0","status ack
+lock not opened
+remaining = 0
+retry > 0","status ack
+lock not opened
+remaining = 0
+retry = 0","timeout
+remaining > 0","timeout
+remaining = 0",timeout
+READY,"confirm lock off
+retry = 2
+lock off first
+set remaining\LOCKING OFF",,,,,,,
+"LOCKING OFF","confirm lock off\","lock off next
+remaining - 1\","lock off next
+remaining - 1\","retry - 1
+lock off first
+set remaining\","start cool down timer
+scan board\COOL DOWN","lock off next
+remaining - 1\","lock status\LOCK STATUS",
+"LOCK STATUS","confirm lock off\","start cool down timer
+scan board\COOL DOWN",,"retry - 1
+lock off first
+set remaining\LOCKING OFF","start cool down timer
+scan board\COOL DOWN",,,"start cool down timer
+scan board\COOL DOWN"
+"COOL DOWN",,,,,,,,"clear task\READY"

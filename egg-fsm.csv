@@ -1,0 +1,9 @@
+state\event,task,"task ack","timeout, retry > 0","timeout, retry = 0"
+READY,"set retry 3
+set timer and interval
+execute\EXECUTING",,,
+EXECUTING,,"set timer and interval
+ack task\CD","retry - 1
+set timer and interval
+execute\","clear task\READY"
+CD,,,,"clear task\READY"

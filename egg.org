@@ -1,0 +1,1126 @@
+#+STARTUP: indent
+* 扭蛋系统
+扭蛋系统采用任务槽模式，最大支持 32 个任务同时运行。每个任务都有独立的
+上下文，状态机。执行时互相不干涉。新任务在执行时，先检查已有任务的 PIN，
+如果出现重复，则继续现有任务的执行，否则找到一个新的任务槽进行执行。每
+个任务都有冷却时间的概念，在冷却时间结束后，任务自动从任务槽中清除。
+** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/egg.h
+  #ifndef _EGG_H
+  #define _EGG_H
+  #include <stdint.h>
+  #include "ring.h"
+  #include "egg_payload.h"
+
+  #define MAX_EGG_TASKS 32
+
+  void egg_setup(struct ring_t * tx, struct ring_t * rx);
+  void egg_start(void);
+  void egg_eventloop(void);
+  void egg_callback(uint8_t egg, egg_payload_t * payload);
+  void egg_lock_on(uint8_t egg, uint8_t cabin, uint16_t pin);
+  void egg_lock_off(uint8_t egg, uint8_t cabin, uint16_t pin);
+  void egg_play(uint8_t egg, uint16_t audio, uint16_t pin);
+  void egg_volume(uint8_t egg, uint8_t volume, uint16_t pin);
+  void egg_gpio(uint8_t egg, uint8_t gpio, uint16_t pin);
+  void egg_query(uint8_t egg, uint8_t cabin, uint16_t pin);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/egg.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "defination.h"
+  #include "egg.h"
+  #include "packet.h"
+  #include "network.h"
+  #include "console.h"
+  #include "utility.h"
+  #include "uart3-packet.h"
+  #include "uart.h"
+  #include "ring.h"
+  #include "egg-fsm.h"
+  #include "upstream.h"
+
+  #define EGG_ACK 0x01
+
+  struct egg_context {
+    uint32_t state;
+    uint32_t timer;
+    uint32_t interval;
+    uint32_t retry;
+    uint16_t pin;
+    uint32_t cmd;
+    uint8_t egg;
+    uint8_t cabin;
+    uint16_t audio;
+    uint8_t volume;
+    uint8_t gpio;
+    uint8_t busy;
+  };
+
+  static struct egg_context ctxs[MAX_EGG_TASKS];
+
+  static struct ring_t * egg_tx;
+  static struct ring_t * egg_rx;
+
+  static uint32_t loop_timer;
+  static uint32_t activated;
+
+
+  <<setup>>
+
+  void egg_start() {
+  }
+
+  <<mainloop>>
+  <<callback>>
+  <<lock-on>>
+  <<lock-off>>
+  <<play>>
+  <<volume>>
+  <<gpio>>
+  <<query>>
+  <<fsm>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  void egg_setup(struct ring_t * tx, struct ring_t * rx) {
+    egg_tx = tx;
+    egg_rx = rx;
+    loop_timer = 0;
+    activated = 0;
+
+    for (uint8_t i = 0; i < MAX_EGG_TASKS; i ++) {
+      bzero(&ctxs[i], sizeof(struct egg_context));
+      ctxs[i].state = EGG_READY_STATE;
+    }
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref mainloop
+  void egg_eventloop() {
+    if (systick > loop_timer) { // interval of 1 seconds
+      loop_timer = systick + 999;
+      for (uint8_t i = 0; i < MAX_EGG_TASKS; i ++) {
+        if (((1 << i) & activated) != 0) {
+          if (ctxs[i].state == EGG_EXECUTING_STATE) {
+            if (systick > ctxs[i].timer) {
+              if (ctxs[i].retry == 0) {
+                ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+              } else {
+                ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+              }
+            }
+          } else if (ctxs[i].state == EGG_CD_STATE) {
+            if (systick > ctxs[i].timer) {
+              ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+            }
+          }
+        }
+      }
+    }
+  }
+#+end_src
+** 状态机
+#+begin_src c :noweb-ref fsm
+  void egg_do_action(enum EGG_ACTION action, void * data) {
+    uint8_t idx = * (uint8_t * ) data;
+    switch (action) {
+    case EGG_SET_RETRY_3_NEWLINE_SET_TIMER_AND_INTERVAL_NEWLINE_EXECUTE_ACTION:
+    case EGG_RETRY_MINUS_1_NEWLINE_SET_TIMER_AND_INTERVAL_NEWLINE_EXECUTE_ACTION:
+      if (action == EGG_SET_RETRY_3_NEWLINE_SET_TIMER_AND_INTERVAL_NEWLINE_EXECUTE_ACTION) {
+        ctxs[idx].retry = 3;
+      } else if (action == EGG_RETRY_MINUS_1_NEWLINE_SET_TIMER_AND_INTERVAL_NEWLINE_EXECUTE_ACTION) {
+        ctxs[idx].retry --;
+      }
+      ctxs[idx].interval = 1000; // 1 second
+      ctxs[idx].timer = systick + ctxs[idx].interval;
+      switch (ctxs[idx].cmd) {
+      case EGG_LOCK_ON:
+        lock_on(ctxs[idx].egg, ctxs[idx].cabin, ctxs[idx].pin);
+        break;
+      case EGG_LOCK_OFF:
+        lock_off(ctxs[idx].egg, ctxs[idx].cabin, ctxs[idx].pin);
+        break;
+      case EGG_PLAY:
+        play(ctxs[idx].egg, ctxs[idx].audio, ctxs[idx].pin);
+        break;
+      case EGG_VOLUME:
+        volume(ctxs[idx].egg, ctxs[idx].volume, ctxs[idx].pin);
+        break;
+      case EGG_GPIO:
+        gpio(ctxs[idx].egg, ctxs[idx].gpio, ctxs[idx].pin);
+        break;
+      case EGG_QUERY:
+        query(ctxs[idx].egg, ctxs[idx].cabin, ctxs[idx].pin);
+        break;
+      }
+      break;
+    case EGG_SET_TIMER_AND_INTERVAL_NEWLINE_ACK_TASK_ACTION: {
+      ctxs[idx].interval = 10000 - ctxs[idx].retry * 1000;
+      if (ctxs[idx].interval > 0xF0000000) {
+        ctxs[idx].interval = 10000; // 10 seconds
+      }
+      ctxs[idx].timer = systick + ctxs[idx].interval;
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.pin = ctxs[idx].pin;
+      confirm.cmd_type = ctxs[idx].cmd;
+      confirm.board = ctxs[idx].egg;
+      switch (ctxs[idx].cmd) {
+      case EGG_LOCK_ON:
+      case EGG_LOCK_OFF:
+        confirm.lock = ctxs[idx].cabin;
+        break;
+      case EGG_PLAY:
+        confirm.audio = ctxs[idx].audio;
+        break;
+      case EGG_VOLUME:
+        confirm.volume= ctxs[idx].volume;
+        break;
+      case EGG_GPIO:
+        confirm.gpio = ctxs[idx].gpio;
+        break;
+      case EGG_QUERY:
+        confirm.lock = ctxs[idx].cabin;
+        confirm.busy = ctxs[idx].busy;
+        break;
+      }
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.reply_time = network_reply_time;
+      confirm.ttl = network_ttl;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t buf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
+      network_write(buf, bufsize);
+      console_log("Confirm ");
+      switch (ctxs[idx].cmd) {
+      case EGG_LOCK_ON:
+        console_string("EGG-LOCK-ON\r\n");
+        break;
+      case EGG_LOCK_OFF:
+        console_string("EGG-LOCK-OFF\r\n");
+        break;
+      case EGG_PLAY:
+        console_string("EGG-PLAY\r\n");
+        break;
+      case EGG_VOLUME:
+        console_string("EGG-VOLUME\r\n");
+        break;
+      case EGG_GPIO:
+        console_string("EGG-GPIO\r\n");
+        break;
+      case EGG_QUERY:
+        console_string("EGG-QUERY\r\n");
+        break;
+      }
+
+      break;
+    }
+    case EGG_CLEAR_TASK_ACTION:
+      activated &= ~(1 << idx);
+      break;
+    }
+  }
+#+end_src
+** 协议回调
+#+begin_src c :noweb-ref callback
+  void egg_callback(uint8_t egg, egg_payload_t * payload) {
+    switch (payload->cmd) {
+    case EGG_ACK: {
+      uint16_t pin = payload->sn;
+      for (uint8_t i = 0; i < MAX_EGG_TASKS; i ++) {
+        if (ctxs[i].pin == pin) {
+          if (payload->ack_type == EGG_QUERY) {
+            ctxs[i].busy = payload->busy;
+          }
+          ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_ACK_EVENT, &i);
+        }
+      }
+      break;
+    }
+    case EGG_TIMEOUT:
+    case EGG_FALLEN: {
+      parameter_t param;
+      bzero(&param, sizeof(parameter_t));
+      param.sn = sn ++;
+      param.lock = payload->cabin;
+      param.board = egg;
+      param.pin = ((egg << 12) | timestamp) & 0xFFFF;
+      param.timestamp = timestamp;
+      param.rssi = network_rssi;
+      param.ber = network_ber;
+      param.reply_time = network_reply_time;
+      param.ttl = network_ttl;
+      param.network_reset = (int) network_reset_times;
+      param.network_shutdown = (int) network_shutdown_times;
+
+      uint8_t param_size = packet_calculate_encode_size(&param);
+      uint8_t upbuf[param_size];
+      uint8_t bufsize = packet_encode(payload->cmd, uid, &param, upbuf, param_size);
+      upstream_send(param.pin, upbuf, bufsize);
+      break;
+    }
+    default:
+      console_log("Unknown command ");
+      console_number(payload->cmd);
+      console_string(" to egg ");
+      console_newline();
+      break;
+    }
+  }
+#+end_src
+** 关锁
+#+begin_src c :noweb-ref lock-on
+  static void lock_on(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_LOCK_ON;
+    packet.payload.egg.cabin = cabin;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_lock_on(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_LOCK_ON(");
+          console_number(egg);
+          console_string(", ");
+          console_number(cabin);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_LOCK_ON;
+        ctxs[i].egg = egg;
+        ctxs[i].cabin = cabin;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** 开锁
+#+begin_src c :noweb-ref lock-off
+  static void lock_off(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_LOCK_OFF;
+    packet.payload.egg.cabin = cabin;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_lock_off(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_LOCK_OFF(");
+          console_number(egg);
+          console_string(", ");
+          console_number(cabin);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_LOCK_OFF;
+        ctxs[i].egg = egg;
+        ctxs[i].cabin = cabin;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** 播放
+#+begin_src c :noweb-ref play
+  static void play(uint8_t egg, uint16_t audio, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_PLAY;
+    packet.payload.egg.audio = audio;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_play(uint8_t egg, uint16_t audio, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_PLAY(");
+          console_number(egg);
+          console_string(", ");
+          console_number(audio);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_PLAY;
+        ctxs[i].egg = egg;
+        ctxs[i].audio = audio;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** 音量调节
+#+begin_src c :noweb-ref volume
+  static void volume(uint8_t egg, uint8_t volume, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_VOLUME;
+    packet.payload.egg.volume = volume;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_volume(uint8_t egg, uint8_t volume, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_VOLUME(");
+          console_number(egg);
+          console_string(", ");
+          console_number(volume);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_VOLUME;
+        ctxs[i].egg = egg;
+        ctxs[i].volume = volume;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** GPIO
+#+begin_src c :noweb-ref gpio
+  static void gpio(uint8_t egg, uint8_t gpio, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_GPIO;
+    packet.payload.egg.gpio = gpio;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_gpio(uint8_t egg, uint8_t gpio, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_GPIO(");
+          console_number(egg);
+          console_string(", ");
+          console_number(gpio);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_GPIO;
+        ctxs[i].egg = egg;
+        ctxs[i].gpio = gpio;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** 查询状态
+#+begin_src c :noweb-ref query
+  static void query(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = EGG;
+    packet.devid = egg;
+    packet.payload.egg.sn = pin;
+    packet.payload.egg.cmd = EGG_QUERY;
+    packet.payload.egg.cabin = cabin;
+    populate_uart3_packet_to_tx(&packet, egg_tx);
+  }
+
+  void egg_query(uint8_t egg, uint8_t cabin, uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) != 0) {
+        if (ctxs[i].pin == pin) {
+          console_log("Found dup command EGG_QUERY(");
+          console_number(egg);
+          console_string(", ");
+          console_number(cabin);
+          console_string(", ");
+          console_number(pin);
+          console_string(")\r\n");
+          return;
+        }
+      }
+    }
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 0) {
+        activated |= (1 << i);
+        ctxs[i].pin = pin;
+        ctxs[i].state = EGG_READY_STATE;
+        ctxs[i].cmd = EGG_QUERY;
+        ctxs[i].egg = egg;
+        ctxs[i].cabin = cabin;
+        ctxs[i].state = egg_transform_state(ctxs[i].state, EGG_TASK_EVENT, &i);
+        break;
+      }
+    }
+  }
+#+end_src
+** 通讯载荷
+#+begin_src c :tangle /dev/shm/boxos/egg_payload.h
+  #ifndef _EGG_PAYLOAD_H
+  #define _EGG_PAYLOAD_H
+  #include <stdint.h>
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+    typedef struct egg_payload egg_payload_t;
+    struct egg_payload {
+      int32_t sn;
+      uint8_t cmd;
+      int32_t timestamp;
+      uint8_t ack_type;
+      uint8_t cabin;
+      int32_t audio;
+      uint8_t gpio;
+      uint8_t volume;
+      uint8_t busy;
+    };
+    int egg_payload_calculate_size(egg_payload_t *);
+    int egg_payload_encode(egg_payload_t *, uint8_t *);
+    int egg_payload_estimate_size(uint8_t *);
+    int egg_payload_decode(uint8_t *, egg_payload_t *);
+  #ifdef ZEROPACK_EGG_PAYLOAD_ENABLED
+    int egg_payload_encode_zeropack(egg_payload_t *, uint8_t *, int);
+    int egg_payload_estimate_zeropack_size(uint8_t *, int);
+    int egg_payload_decode_zeropack(uint8_t *, int, uint8_t *, egg_payload_t *);
+  #endif
+  #ifdef __cplusplus
+  }
+  #endif
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/egg_payload.c
+  #include <stdlib.h>
+  #include <string.h>
+  #ifdef ZEROPACK_EGG_PAYLOAD_ENABLED
+  #include "zeropack.h"
+  #endif
+  #include "tightrope.h"
+  #include "egg_payload.h"
+  int egg_payload_calculate_size(egg_payload_t * egg_payload) {
+    int size = 2;
+    short tags[9];
+    int len = 0;
+    if (egg_payload->sn != 0) {
+      tags[len ++] = 0;
+      if (egg_payload->sn > 0 && egg_payload->sn < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (egg_payload->cmd != 0) {
+      tags[len ++] = 1;
+      if (egg_payload->cmd > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (egg_payload->timestamp != 0) {
+      tags[len ++] = 2;
+      if (egg_payload->timestamp > 0 && egg_payload->timestamp < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (egg_payload->ack_type != 0) {
+      tags[len ++] = 3;
+      if (egg_payload->ack_type > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (egg_payload->cabin != 0) {
+      tags[len ++] = 4;
+      if (egg_payload->cabin > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (egg_payload->audio != 0) {
+      tags[len ++] = 5;
+      if (egg_payload->audio > 0 && egg_payload->audio < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (egg_payload->gpio != 0) {
+      tags[len ++] = 6;
+      if (egg_payload->gpio > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (egg_payload->volume != 0) {
+      tags[len ++] = 7;
+      if (egg_payload->volume > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (egg_payload->busy != 0) {
+      tags[len ++] = 8;
+      if (egg_payload->busy > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (len > 0) {
+      if (tags[0] != 0) {
+        size += 2;
+      }
+      for (int i = 1; i < len; i ++) {
+        if (tags[i - 1] + 1 != tags[i]) size += 2;
+      }
+    }
+    return size;
+  }
+  static int egg_payload_set__fields(egg_payload_t * egg_payload, uint8_t * buf, short * dtags, int * dlen) {
+    int ptr = 2;
+    short count = 0;
+    for (short tag = 0, nexttag = 0; nexttag < 9; nexttag ++) {
+      switch (nexttag) {
+      case 0:
+        if (egg_payload->sn != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->sn > 0 && egg_payload->sn < 16383) {
+            short t = (short) ((egg_payload->sn + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 0;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 1:
+        if (egg_payload->cmd != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->cmd > 0) {
+            short t = (short) ((egg_payload->cmd + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 1;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 2:
+        if (egg_payload->timestamp != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->timestamp > 0 && egg_payload->timestamp < 16383) {
+            short t = (short) ((egg_payload->timestamp + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 2;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 3:
+        if (egg_payload->ack_type != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->ack_type > 0) {
+            short t = (short) ((egg_payload->ack_type + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 3;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 4:
+        if (egg_payload->cabin != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->cabin > 0) {
+            short t = (short) ((egg_payload->cabin + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 4;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 5:
+        if (egg_payload->audio != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->audio > 0 && egg_payload->audio < 16383) {
+            short t = (short) ((egg_payload->audio + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 5;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 6:
+        if (egg_payload->gpio != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->gpio > 0) {
+            short t = (short) ((egg_payload->gpio + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 6;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 7:
+        if (egg_payload->volume != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->volume > 0) {
+            short t = (short) ((egg_payload->volume + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 7;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 8:
+        if (egg_payload->busy != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (egg_payload->busy > 0) {
+            short t = (short) ((egg_payload->busy + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 8;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      default:
+        break;
+      }
+    }
+    buf[0] = SHORT0(count);
+    buf[1] = SHORT1(count);
+    return ptr;
+  }
+  static int egg_payload_set__data(egg_payload_t * egg_payload, uint8_t * buf, short * dtags, int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(egg_payload->sn);
+        buf[ptr ++] = INT1(egg_payload->sn);
+        buf[ptr ++] = INT2(egg_payload->sn);
+        buf[ptr ++] = INT3(egg_payload->sn);
+        break;
+      }
+      case 1: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->cmd;
+        break;
+      }
+      case 2: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(egg_payload->timestamp);
+        buf[ptr ++] = INT1(egg_payload->timestamp);
+        buf[ptr ++] = INT2(egg_payload->timestamp);
+        buf[ptr ++] = INT3(egg_payload->timestamp);
+        break;
+      }
+      case 3: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->ack_type;
+        break;
+      }
+      case 4: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->cabin;
+        break;
+      }
+      case 5: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(egg_payload->audio);
+        buf[ptr ++] = INT1(egg_payload->audio);
+        buf[ptr ++] = INT2(egg_payload->audio);
+        buf[ptr ++] = INT3(egg_payload->audio);
+        break;
+      }
+      case 6: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->gpio;
+        break;
+      }
+      case 7: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->volume;
+        break;
+      }
+      case 8: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = egg_payload->busy;
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return ptr;
+  }
+  int egg_payload_encode(egg_payload_t * egg_payload, uint8_t * buf) {
+    short dtags[9];
+    int dlen = 0;
+    int ptr0 = egg_payload_set__fields(egg_payload, buf, dtags, &dlen);
+    int ptr1 = egg_payload_set__data(egg_payload, buf + ptr0, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_EGG_PAYLOAD_ENABLED
+  int egg_payload_encode_zeropack(egg_payload_t * egg_payload, uint8_t * buf, int len) {
+    uint8_t obuf[len];
+    int size = egg_payload_encode(egg_payload, obuf);
+    return zeropack(obuf, size, buf);
+  }
+  #endif
+  int egg_payload_estimate_size(uint8_t * buf) {
+    int ptr = 0;
+    short tag = 0;
+    short dtags[9];
+    int dlen = 0;
+    int size = sizeof(egg_payload_t);
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[dlen ++] = tag;
+        tag ++;
+      } else {
+        tag ++;
+      }
+    }
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 1: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 2: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 3: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 4: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 5: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 6: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 7: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 8: {
+        ptr += 4 + 1;
+        break;
+      }
+      default: {
+        int s = INT(buf + ptr);
+        ptr += 4 + s;
+        break;
+      }
+      }
+    }
+    return size;
+  }
+  #ifdef ZEROPACK_EGG_PAYLOAD_ENABLED
+  int egg_payload_estimate_zeropack_size(uint8_t * buf, int len) {
+    uint8_t factor = buf[0];
+    uint8_t uzpbuf[len * factor];
+    unzeropack(buf, len, uzpbuf);
+    return egg_payload_estimate_size(uzpbuf);
+  }
+  #endif
+  static int egg_payload_parse_fields(uint8_t * buf, egg_payload_t * egg_payload, short * dtags, int * dlen) {
+    int ptr = 0;
+    short tag = 0;
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[* dlen] = tag;
+        (* dlen) ++;
+        tag ++;
+      } else if (tag == 0) {
+        tag ++;
+        egg_payload->sn = (value >> 1) - 1;
+      } else if (tag == 1) {
+        tag ++;
+        egg_payload->cmd = (value >> 1) - 1;
+      } else if (tag == 2) {
+        tag ++;
+        egg_payload->timestamp = (value >> 1) - 1;
+      } else if (tag == 3) {
+        tag ++;
+        egg_payload->ack_type = (value >> 1) - 1;
+      } else if (tag == 4) {
+        tag ++;
+        egg_payload->cabin = (value >> 1) - 1;
+      } else if (tag == 5) {
+        tag ++;
+        egg_payload->audio = (value >> 1) - 1;
+      } else if (tag == 6) {
+        tag ++;
+        egg_payload->gpio = (value >> 1) - 1;
+      } else if (tag == 7) {
+        tag ++;
+        egg_payload->volume = (value >> 1) - 1;
+      } else if (tag == 8) {
+        tag ++;
+        egg_payload->busy = (value >> 1) - 1;
+      } else {
+        tag ++;
+      }
+    }
+    return ptr;
+  }
+  static int egg_payload_parse_data(uint8_t * buf, egg_payload_t * egg_payload, short * dtags, const int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4;
+        egg_payload->sn = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 1: {
+        ptr += 4;
+        egg_payload->cmd = buf[ptr ++];
+        break;
+      }
+      case 2: {
+        ptr += 4;
+        egg_payload->timestamp = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 3: {
+        ptr += 4;
+        egg_payload->ack_type = buf[ptr ++];
+        break;
+      }
+      case 4: {
+        ptr += 4;
+        egg_payload->cabin = buf[ptr ++];
+        break;
+      }
+      case 5: {
+        ptr += 4;
+        egg_payload->audio = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 6: {
+        ptr += 4;
+        egg_payload->gpio = buf[ptr ++];
+        break;
+      }
+      case 7: {
+        ptr += 4;
+        egg_payload->volume = buf[ptr ++];
+        break;
+      }
+      case 8: {
+        ptr += 4;
+        egg_payload->busy = buf[ptr ++];
+        break;
+      }
+      default: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        ptr += size;
+        break;
+      }
+      }
+    }
+    return ptr;
+  }
+  int egg_payload_decode(uint8_t * buf, egg_payload_t * egg_payload) {
+    short dtags[9];
+    int dlen = 0;
+    int ptr0 = egg_payload_parse_fields(buf, egg_payload, dtags, &dlen);
+    int ptr1 = egg_payload_parse_data(buf + ptr0, egg_payload, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_EGG_PAYLOAD_ENABLED
+  int egg_payload_decode_zeropack(uint8_t * buf, int len, uint8_t * uzpbuf, egg_payload_t * egg_payload) {
+    unzeropack(buf, len, uzpbuf);
+    return egg_payload_decode(uzpbuf, egg_payload);
+  }
+  #endif
+#+end_src

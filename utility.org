@@ -1,0 +1,725 @@
+#+STARTUP: indent
+* 辅助代码
+** base64
+#+begin_src c :tangle /dev/shm/boxos/base64.h
+  #ifndef _BASE64_H
+  #define _BASE64_H
+  #include <stdint.h>
+  uint32_t base64_encode_length(uint32_t len);
+  uint32_t base64_encode(const uint8_t *src, uint32_t len, uint8_t *dst, uint32_t dst_len);
+
+  uint32_t base64_decode_length(const uint8_t * buf, uint32_t len);
+  uint32_t base64_decode(const uint8_t * src, const uint32_t len, uint8_t * dst, const uint32_t dstlen);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/base64.c
+  #include <stdint.h>
+  #include "base64.h"
+
+  static const uint8_t base64_table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  uint32_t base64_encode_length(uint32_t len) {
+    uint32_t olen = len * 4 / 3 + 4; /* 3-byte blocks to 4-byte */
+    return olen;
+  }
+
+  uint32_t base64_encode(const uint8_t *src, uint32_t len, uint8_t *dst, uint32_t dst_len) {
+    uint8_t *pos;
+    const uint8_t *end;
+
+    if (dst_len < len)
+      return 0; /* integer overflow */
+
+    end = src + len;
+    pos = dst;
+    while (end - src >= 3) {
+      ,*pos++ = base64_table[src[0] >> 2];
+      ,*pos++ = base64_table[((src[0] & 0x03) << 4) | (src[1] >> 4)];
+      ,*pos++ = base64_table[((src[1] & 0x0f) << 2) | (src[2] >> 6)];
+      ,*pos++ = base64_table[src[2] & 0x3f];
+      src += 3;
+    }
+
+    if (end - src) {
+      ,*pos++ = base64_table[src[0] >> 2];
+      if (end - src == 1) {
+        ,*pos++ = base64_table[(src[0] & 0x03) << 4];
+        ,*pos++ = '=';
+      } else {
+        ,*pos++ = base64_table[((src[0] & 0x03) << 4) | (src[1] >> 4)];
+        ,*pos++ = base64_table[(src[1] & 0x0f) << 2];
+      }
+      ,*pos++ = '=';
+    }
+
+    return pos - dst;
+  }
+
+  static const int b64index[256] = {
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 62, 63, 62, 62, 63, 52, 53, 54, 55,
+    56, 57, 58, 59, 60, 61,  0,  0,  0,  0,  0,  0,  0,  0,  1,  2,  3,  4,  5,  6,
+    7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,  0,
+    0,  0,  0, 63,  0, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51
+  };
+
+  uint32_t base64_decode_length(const uint8_t * buf, uint32_t len) {
+    int pad = len > 0 && (len % 4 || buf[len - 1] == '=');
+    uint32_t L = ((len + 3) / 4 - pad) * 4;
+    uint32_t size = L / 4 * 3 + pad;
+    if (len > L + 2 && buf[L + 2] != '=') size ++;
+    return size;
+  }
+
+  uint32_t base64_decode(const uint8_t * src, const uint32_t len, uint8_t * dst, const uint32_t dstlen) {
+    uint32_t ptr = 0;
+    int pad = len > 0 && (len % 4 || src[len - 1] == '=');
+    const uint32_t L = (dstlen - pad) / 3 * 4;
+
+    for (uint32_t i = 0; i < L; i += 4) {
+      int n = b64index[src[i]] << 18 | b64index[src[i + 1]] << 12 | b64index[src[i + 2]] << 6 | b64index[src[i + 3]];
+      dst[ptr++] = n >> 16;
+      dst[ptr++] = n >> 8 & 0xFF;
+      dst[ptr++] = n & 0xFF;
+    }
+    if (pad) {
+      int n = b64index[src[L]] << 18 | b64index[src[L + 1]] << 12;
+      dst[ptr++] = n >> 16;
+
+      if (len > L + 2 && src[L + 2] != '=') {
+        n |= b64index[src[L + 2]] << 6;
+        dst[ptr++] = n >> 8 & 0xFF;
+      }
+    }
+    return ptr;
+  }
+#+end_src
+** hash
+#+begin_src c :tangle /dev/shm/boxos/hash.h
+  #ifndef __HASH_H
+  #define __HASH_H
+  #include <stdint.h>
+
+  uint8_t crc8(uint8_t * buf, uint32_t size);
+  uint8_t crc8_maxim(uint8_t * buf, uint32_t size);
+  uint8_t crc8_maxim_update(uint8_t base, uint8_t * buf, uint32_t size);
+  uint32_t adler32(uint8_t * buf, uint32_t size);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/hash.c
+  #include "hash.h"
+
+  static uint8_t _crc8(uint32_t key, uint8_t base, uint8_t * buf, uint32_t size) {
+    uint8_t crc = base;
+    while (size-- != 0) {
+      for (uint8_t i = 0x80; i != 0; i /= 2) {
+        if ((crc & 0x80) != 0) {
+          crc = crc << 1;
+          crc ^= key;
+        } else {
+          crc = crc << 1;
+        }
+        if (( * buf & i) != 0) {
+          crc ^= key;
+        }
+      }
+      buf ++;
+    }
+    return crc;
+  }
+
+  uint8_t crc8(uint8_t * buf, uint32_t size) {
+    return _crc8(0x07, 0, buf, size);
+  }
+
+  uint8_t crc8_maxim_update(uint8_t base, uint8_t * buf, uint32_t size) {
+    uint8_t crc = base;
+    for (uint32_t i = 0; i < size; i ++) {
+      crc ^= buf[i];
+      for (uint8_t j = 0; j < 8; j ++) {
+        if (crc & 0x01) {
+          crc = (crc >> 1) ^ 0x8c;
+        } else {
+          crc >>= 1;
+        }
+      }
+    }
+    return crc;
+  }
+
+  uint8_t crc8_maxim(uint8_t * buf, uint32_t size) {
+    return crc8_maxim_update(0, buf, size);
+  }
+
+
+  uint32_t adler32(uint8_t * buf, uint32_t size) {
+    uint32_t a = 1, b = 0;
+    for (uint8_t i = 0; i < size; i ++) {
+      uint8_t d = buf[i];
+      a = (a + d) % 66521;
+      b = (a + b) % 66521;
+    }
+    return (b << 16) | a;
+  }
+#+end_src
+** mt19937
+#+begin_src c :tangle /dev/shm/boxos/mt19937.h
+  #ifndef _MT19937_H
+  #define _MT19937_H
+  #include <stdint.h>
+
+  void mt19937_init_by_array(uint32_t init_key[], uint32_t key_length);
+  uint32_t mt19937_uint32(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/mt19937.c
+  #include "mt19937.h"
+
+  /* Period parameters */
+  #define N 624
+  #define M 397
+  #define MATRIX_A 0x9908b0dfUL   /* constant vector a */
+  #define UPPER_MASK 0x80000000UL /* most significant w-r bits */
+  #define LOWER_MASK 0x7fffffffUL /* least significant r bits */
+
+  static uint32_t mt[N]; /* the array for the state vector  */
+  static int mti=N+1; /* mti==N+1 means mt[N] is not initialized */
+
+  /* initializes mt[N] with a seed */
+  static void init_genrand(uint32_t s) {
+    mt[0]= s & 0xffffffffUL;
+    for (mti=1; mti<N; mti++) {
+      mt[mti] =
+        (1812433253UL * (mt[mti-1] ^ (mt[mti-1] >> 30)) + mti);
+      /* See Knuth TAOCP Vol2. 3rd Ed. P.106 for multiplier. */
+      /* In the previous versions, MSBs of the seed affect   */
+      /* only MSBs of the array mt[].                        */
+      /* 2002/01/09 modified by Makoto Matsumoto             */
+      mt[mti] &= 0xffffffffUL;
+      /* for >32 bit machines */
+    }
+  }
+
+  /* initialize by an array with array-length */
+  /* init_key is the array for initializing keys */
+  /* key_length is its length */
+  /* slight change for C++, 2004/2/26 */
+  void mt19937_init_by_array(uint32_t init_key[], uint32_t key_length) {
+    uint32_t i, j, k;
+    init_genrand(19650218UL);
+    i = 1; j = 0;
+    k = (N > key_length ? N : key_length);
+    for (; k; k--) {
+      mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1664525UL))
+        + init_key[j] + j; /* non linear */
+      mt[i] &= 0xffffffffUL; /* for WORDSIZE > 32 machines */
+      i++; j++;
+      if (i>=N) { mt[0] = mt[N-1]; i=1; }
+      if (j>=key_length) j=0;
+    }
+    for (k=N-1; k; k--) {
+      mt[i] = (mt[i] ^ ((mt[i-1] ^ (mt[i-1] >> 30)) * 1566083941UL))
+        - i; /* non linear */
+      mt[i] &= 0xffffffffUL; /* for WORDSIZE > 32 machines */
+      i++;
+      if (i>=N) { mt[0] = mt[N-1]; i=1; }
+    }
+
+    mt[0] = 0x80000000UL; /* MSB is 1; assuring non-zero initial array */
+  }
+
+  /* generates a random number on [0,0xffffffff]-interval */
+  uint32_t mt19937_uint32(void) {
+    uint32_t y;
+    static unsigned long mag01[2]={0x0UL, MATRIX_A};
+    /* mag01[x] = x * MATRIX_A  for x=0,1 */
+
+    if (mti >= N) { /* generate N words at one time */
+      int kk;
+
+      if (mti == N+1)   /* if init_genrand() has not been called, */
+        init_genrand(5489UL); /* a default initial seed is used */
+
+      for (kk=0;kk<N-M;kk++) {
+        y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
+        mt[kk] = mt[kk+M] ^ (y >> 1) ^ mag01[y & 0x1UL];
+      }
+      for (;kk<N-1;kk++) {
+        y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
+        mt[kk] = mt[kk+(M-N)] ^ (y >> 1) ^ mag01[y & 0x1UL];
+      }
+      y = (mt[N-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
+      mt[N-1] = mt[M-1] ^ (y >> 1) ^ mag01[y & 0x1UL];
+
+      mti = 0;
+    }
+
+    y = mt[mti++];
+
+    /* Tempering */
+    y ^= (y >> 11);
+    y ^= (y << 7) & 0x9d2c5680UL;
+    y ^= (y << 15) & 0xefc60000UL;
+    y ^= (y >> 18);
+
+    return y;
+  }
+#+end_src
+** ring
+#+begin_src c :tangle /dev/shm/boxos/ring.h
+  #ifndef __RING_H
+  #define __RING_H
+  #include <stdint.h>
+  struct ring_t {
+    uint8_t * data;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t mask;
+  };
+
+  #define ring_length(r) ((r)->tail - (r)->head)
+
+  #define ring_is_empty(r) ((r)->head == (r)->tail)
+
+  #define ring_empty(r) do {  \
+      (r)->head = 0;          \
+      (r)->tail = 0;          \
+    } while(0)
+
+  #define ring_available(r) ((r)->mask + 1 - ring_length(r))
+
+  void ring_init(struct ring_t * ring, uint8_t * data, uint32_t bitsize);
+  uint32_t ring_write(struct ring_t * ring, uint8_t data);
+  uint32_t ring_write_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size);
+  uint32_t ring_read(struct ring_t * ring, uint8_t * data);
+  uint32_t ring_read_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size);
+  uint32_t ring_pop(struct ring_t * ring, uint32_t size);
+  uint32_t ring_at(struct ring_t * ring, uint32_t index, uint8_t * data);
+  uint32_t ring_set(struct ring_t * ring, uint32_t index, uint8_t data);
+  int32_t ring_find(struct ring_t * ring, uint8_t * data, uint32_t size, int32_t * position);
+  int32_t ring_find_in(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * data, uint32_t size, int32_t * position);
+  uint32_t ring_copy(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * buf, uint32_t size, uint32_t * count);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/ring.c
+  #include "ring.h"
+
+  #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+  void ring_init(struct ring_t * ring, uint8_t * data, uint32_t bitsize) {
+    ring->data = data;
+    ring->head = 0;
+    ring->tail = 0;
+    ring->mask = (2 << (bitsize - 1)) - 1;
+  }
+
+  uint32_t ring_write(struct ring_t * ring, uint8_t data) {
+    if (ring_available(ring) == 0) {
+      return 0;
+    }
+    ring->data[ring->tail & ring->mask] = data;
+    ring->tail += 1;
+    return 1;
+  }
+
+  uint32_t ring_write_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size) {
+    uint32_t cnt = 0;
+    while (ring_available(ring) > 0 && cnt < size) {
+      ring->data[ring->tail & ring->mask] = data[offset + cnt];
+      ring->tail += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_read(struct ring_t * ring, uint8_t * data) {
+    if (ring_is_empty(ring)) {
+      return 0;
+    }
+
+    ,* data = ring->data[ring->head & ring->mask];
+    ring->head += 1;
+    return 1;
+  }
+
+  uint32_t ring_read_array(struct ring_t * ring, uint8_t * data, uint32_t offset, uint32_t size) {
+    uint32_t cnt = 0;
+    while (!ring_is_empty(ring) && cnt < size) {
+      data[offset + cnt] = ring->data[ring->head & ring->mask];
+      ring->head += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_pop(struct ring_t * ring, uint32_t size) {
+    uint32_t cnt = 0;
+    while (!ring_is_empty(ring) && cnt < size) {
+      ring->head += 1;
+      cnt ++;
+    }
+    return cnt;
+  }
+
+  uint32_t ring_at(struct ring_t * ring, uint32_t index, uint8_t * data) {
+    if (ring_length(ring) <= index) {
+      return 0;
+    }
+
+    ,* data = ring->data[(ring->head + index) & ring->mask];
+    return 1;
+  }
+
+  uint32_t ring_set(struct ring_t * ring, uint32_t index, uint8_t data) {
+    if (ring_length(ring) <= index) {
+      return 0;
+    }
+
+    ring->data[(ring->head + index) & ring->mask] = data;
+    return 1;
+  }
+
+  int32_t ring_find(struct ring_t * ring, uint8_t * data, uint32_t size, int32_t * position) {
+    int32_t offset = -1;
+    int32_t found;
+    uint32_t ringlen = ring_length(ring);
+    if (size > ringlen) {
+      return -1;
+    }
+    int32_t len = ringlen - size + 1;
+    uint32_t head = ring->head;
+    for (int32_t i = 0; i < len; i ++) {
+      found = 1;
+      for (uint32_t j = 0; j < size; j ++) {
+        if (ring->data[(head + i + j) & ring->mask] != data[j]) {
+          found = 0;
+          break;
+        }
+      }
+      if (found == 1) {
+        offset = i;
+        break;
+      }
+    }
+    if (position != 0) {
+      ,* position = offset;
+    }
+    return offset;
+  }
+
+  int32_t ring_find_in(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * data, uint32_t size, int32_t * position) {
+    int32_t offset = -1;
+    int32_t found;
+    uint32_t ringlen = ring_length(ring);
+    if (size > ringlen) {
+      return -1;
+    }
+    if (stop > ringlen) {
+      stop = ringlen;
+    }
+    if (stop - start < size) {
+      return -1;
+    }
+    int32_t len = stop - size - start + 1;
+    uint32_t head = ring->head;
+    for (int32_t i = 0; i < len; i ++) {
+      found = 1;
+      for (uint32_t j = 0; j < size; j ++) {
+        if (ring->data[(head + start + i + j) & ring->mask] != data[j]) {
+          found = 0;
+          break;
+        }
+      }
+      if (found == 1) {
+        offset = i + start;
+        break;
+      }
+    }
+    if (position != 0) {
+      ,* position = offset;
+    }
+    return offset;
+  }
+
+  uint32_t ring_copy(struct ring_t * ring, uint32_t start, uint32_t stop, uint8_t * buf, uint32_t size, uint32_t * count) {
+    uint32_t cnt = 0;
+    uint32_t ringlen = ring_length(ring);
+    /*
+    if (size > ringlen) {
+      return 0;
+    }
+    ,*/
+    if (stop > ringlen) {
+      stop = ringlen;
+    }
+    if (stop - start > size) {
+      return 0;
+    }
+    uint32_t head = ring->head;
+    for (uint32_t i = 0; i < MIN(size, stop - start); i ++, cnt ++) {
+      buf[cnt] = ring->data[(head + start + i) & ring->mask];
+    }
+    if (count != 0) {
+      ,* count = cnt;
+    }
+    return cnt;
+  }
+#+end_src
+** stack
+#+begin_src c :tangle /dev/shm/boxos/stack.h
+  #ifndef _STACK_H
+  #define _STACK_H
+  #include <stdint.h>
+
+  struct stack_t {
+    uint8_t * buffer;
+    int top;
+    uint32_t capacity;
+  };
+
+  void stack_init(struct stack_t * stack, uint8_t * buffer, uint32_t capacity);
+  uint32_t stack_push(struct stack_t * stack, uint8_t e);
+  uint32_t stack_pop(struct stack_t * stack);
+  uint32_t stack_top(struct stack_t * stack, uint8_t * e);
+  uint32_t stack_isempty(struct stack_t * stack);
+  void stack_clear(struct stack_t * stack);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/stack.c
+  #include "stack.h"
+
+  void stack_init(struct stack_t * stack, uint8_t * buffer, uint32_t capacity) {
+    stack->buffer = buffer;
+    stack->capacity = capacity;
+    stack->top = -1;
+  }
+
+  uint32_t stack_push(struct stack_t * stack, uint8_t e) {
+    if (stack->top < (int) stack->capacity) {
+      stack->top ++ ;
+      stack->buffer[stack->top] = e;
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  uint32_t stack_pop(struct stack_t * stack) {
+    if (stack->top != -1) {
+      stack->top --;
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  uint32_t stack_top(struct stack_t * stack, uint8_t * e) {
+    if (stack->top != -1) {
+      ,* e = stack->buffer[stack->top];
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  uint32_t stack_isempty(struct stack_t * stack) {
+    return stack->top == -1;
+  }
+
+  void stack_clear(struct stack_t * stack) {
+    stack->top = -1;
+  }
+#+end_src
+** utility
+#+begin_src c :tangle /dev/shm/boxos/utility.h
+  #ifndef _UTILITY_H
+  #define _UTILITY_H
+  #include <stdint.h>
+
+  void delay(uint32_t ms);
+  uint8_t uint_to_string(uint32_t num, char buf[10]);
+  uint8_t ulong_to_string(uint64_t num, char buf[20]);
+  uint32_t string_to_uint(char * buf, uint32_t size);
+  void bzero(void * base, uint32_t size);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/utility.c
+  #include "utility.h"
+  #include "console.h"
+
+  void delay(uint32_t ms) {
+    ms *= 1440 * 4; // 3360=168MHz, 1440=72MHz
+    while (ms--) {
+      __asm ("nop");
+    }
+  }
+
+  uint8_t uint_to_string(uint32_t num, char buf[10]) {
+    for (int i = 0; i < 10; i ++) {
+      buf[i] = 0;
+    }
+    if (num == 0) {
+      buf[0] = '0';
+      return 1;
+    }
+
+    uint8_t ptr = 0;
+    while (num != 0) {
+      buf[ptr ++] = (num % 10) + 0x30;
+      num /= 10;
+    }
+    for (uint32_t i = 0, len = ptr / 2; i < len; i ++) {
+      char tmp = buf[i];
+      buf[i] = buf[ptr - i - 1];
+      buf[ptr - i - 1] = tmp;
+    }
+    return ptr;
+  }
+
+  uint8_t ulong_to_string(uint64_t num, char buf[20]) {
+    for (int i = 0; i < 20; i ++) {
+      buf[i] = 0;
+    }
+    if (num == 0) {
+      buf[0] = '0';
+      return 1;
+    }
+
+    uint8_t ptr = 0;
+    while (num != 0) {
+      buf[ptr ++] = (num % 10) + 0x30;
+      num /= 10;
+    }
+    for (uint32_t i = 0, len = ptr / 2; i < len; i ++) {
+      char tmp = buf[i];
+      buf[i] = buf[ptr - i - 1];
+      buf[ptr - i - 1] = tmp;
+    }
+    return ptr;
+  }
+
+  uint32_t string_to_uint(char * buf, uint32_t size) {
+    uint32_t num = 0;
+    for (uint32_t i = 0; i < size; i ++) {
+      num *= 10;
+      switch (buf[i]) {
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+      case '7':
+      case '8':
+      case '9':
+        num += buf[i] - 0x30;
+      }
+    }
+    return num;
+  }
+
+  void bzero(void * base, uint32_t size) {
+    uint32_t end = (uint32_t)base + size;
+    while ((uint32_t)base != end) {
+      ,*(uint8_t *) base = 0;
+      base ++;
+    }
+  }
+#+end_src
+** 宏定义
+#+begin_src c :tangle /dev/shm/boxos/defination.h
+  #ifndef __DEFINATION_H
+  #define __DEFINATION_H
+  #include <libopencm3/stm32/gpio.h>
+
+  void network_read_callback(uint8_t * buf, uint32_t len);
+  void network_notify_connected(void);
+  void confirm_lock(uint8_t cmd, uint8_t board, uint8_t * data, uint8_t len);
+
+  #ifdef ESP8266
+  #define ESP8266_USART            UART5
+  #define ESP8266_USART_ISR        uart5_isr
+  #define ESP8266_RCC              RCC_UART5
+  #define ESP8266_RCC_GPIO         (RCC_GPIOC | RCC_GPIOD)
+  #define ESP8266_NVIC_IRQ         NVIC_UART5_IRQ
+  #define ESP8266_TX_IO            GPIO_UART5_TX
+  #define ESP8266_RX_IO            GPIO_UART5_RX
+  #define ESP8266_TX_PORT          GPIOC
+  #define ESP8266_RX_PORT          GPIOD
+  #define ESP8266_RESET_RCC        RCC_GPIOA
+  #define ESP8266_RESET_PORT       GPIOA
+  #define ESP8266_RESET_IO         GPIO11
+  #define ESP8266_POWER_RCC        RCC_GPIOA
+  #define ESP8266_POWER_PORT       GPIOA
+  #define ESP8266_POWER_IO         GPIO12
+  #endif
+
+  #ifdef EC20
+  #define EC20_USART               USART2
+  #define EC20_USART_ISR           usart2_isr
+  #define EC20_RCC                 RCC_USART2
+  #define EC20_RCC_GPIO            RCC_GPIOA
+  #define EC20_NVIC_IRQ            NVIC_USART2_IRQ
+  #define EC20_TX_IO               GPIO_USART2_TX
+  #define EC20_RX_IO               GPIO_USART2_RX
+  #define EC20_PORT                GPIOA
+  #define EC20_RESET_RCC           RCC_GPIOC
+  #define EC20_RESET_PORT          GPIOC
+  #define EC20_RESET_IO            GPIO13
+  #define EC20_POWER_RCC           RCC_GPIOC
+  #define EC20_POWER_PORT          GPIOC
+  #define EC20_POWER_IO            GPIO0
+  #endif
+
+  #define LED_PORT                 GPIOA
+  #define LED_IO                   GPIO8
+
+  #define LIGHT_RCC                RCC_GPIOC
+  #define LIGHT_PORT               GPIOC
+  #define LIGHT_IO                 GPIO4
+  #define FAN_RCC                  RCC_GPIOC
+  #define FAN_PORT                 GPIOC
+  #define FAN_IO                   GPIO5
+  #define ULTRAVIOLET_RCC          RCC_GPIOB
+  #define ULTRAVIOLET_PORT         GPIOB
+  #define ULTRAVIOLET_IO           GPIO0
+  #define CAMERA_RCC               RCC_GPIOB
+  #define CAMERA_PORT              GPIOB
+  #define CAMERA_IO                GPIO1
+
+  #define TEMPERATURE_ADC          ADC1
+  #define TEMPERATURE_ADC_DR       ADC1_DR
+  #define TEMPERATURE_RCC          RCC_ADC1
+  #define TEMPERATURE_DMA_RCC      RCC_DMA1
+  #define TEMPERATURE_DMA          DMA1
+  #define TEMPERATURE_DMA_CHANNEL  DMA_CHANNEL1
+  #define TEMPERATURE_CHANNEL      ADC_CHANNEL16
+
+  #define ON                       1
+  #define OFF                      0
+  #define MAX_LOCK_BOARDS          8
+  #define MAX_CARD_READERS         8
+  #define MIN_TIMESTAMP            1520213204000
+  #ifdef LOCK_FC
+  #define MAX_LOCKS                24
+  #else
+  #define MAX_LOCKS                20
+  #endif
+
+  #define MIN(a, b) ((a) < (b) ? (a) : (b))
+  #define QUOTE_(x) #x
+  #define QUOTE(x) QUOTE_(x)
+
+  extern volatile uint32_t sn;
+  extern uint8_t * uid;
+  extern volatile int64_t timestamp;
+  extern volatile int64_t zone;
+  extern volatile uint32_t systick;
+  extern uint32_t randkey[4];
+
+  #endif
+#+end_src

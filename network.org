@@ -1,0 +1,2179 @@
+#+STARTUP: indent
+* 网络接口
+** 通用接口
+#+begin_src c :tangle /dev/shm/boxos/network.h
+  #ifndef _NETWORK_H
+  #define _NETWORK_H
+  #include <stdint.h>
+
+  extern uint32_t network_reset_times;
+  extern uint32_t network_shutdown_times;
+  extern uint32_t network_heart_rate;
+  extern uint32_t network_timeout;
+  extern uint8_t network_rssi;
+  extern uint8_t network_ber;
+  extern uint8_t network_ttl;
+  extern uint16_t network_reply_time;
+
+  void network_setup(void);
+  void network_start(void);
+  void network_eventloop(void);
+  void network_write(uint8_t * data, uint32_t size);
+  uint8_t network_is_online(void);
+  uint32_t network_available(void);
+  void network_config_confirm(int16_t pin);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/network.c
+  #include "network.h"
+  #include "defination.h"
+  #include "packet.h"
+  #include "utility.h"
+
+  #ifdef ESP8266
+  #include "esp8266.h"
+  #endif
+
+  #ifdef EC20
+  #include "ec20.h"
+  #endif
+
+  uint32_t network_reset_times = 0;
+  uint32_t network_shutdown_times = 0;
+
+  uint32_t network_heart_rate = 31; // how long to send a ping
+
+  #ifdef ESP8266
+  uint32_t network_timeout = 90000; // the interval of reconnect network cause of no response from network (unit: 1ms)
+  #else
+  uint32_t network_timeout = 90000; // the interval of reconnect network cause of no response from network (unit: 1ms)
+  #endif
+
+  uint8_t network_rssi = 0;
+  uint8_t network_ber = 0;
+  uint8_t network_ttl = 0;
+  uint16_t network_reply_time = 0;
+
+  void network_setup(void) {
+  #ifdef ESP8266
+    esp8266_setup();
+    network_rssi = 31;
+  #endif
+  #ifdef EC20
+    ec20_setup();
+  #endif
+  }
+
+  void network_start(void) {
+  #ifdef ESP8266
+    esp8266_start();
+  #endif
+  #ifdef EC20
+    ec20_start();
+  #endif
+  }
+
+  void network_eventloop(void) {
+  #ifdef ESP8266
+    esp8266_eventloop();
+  #endif
+
+  #ifdef EC20
+    ec20_eventloop();
+  #endif
+  }
+
+  void network_write(uint8_t * data, uint32_t size) {
+
+  #ifdef ESP8266
+    if (ring_available(&esp8266_tx) >= size) {
+      esp8266_write(data, size);
+    }
+  #endif
+
+  #ifdef EC20
+    if (ring_available(&ec20_tx) >= size) {
+      ec20_write(data, size);
+    }
+  #endif
+  }
+
+  uint8_t network_is_online() {
+
+  #ifdef ESP8266
+    if (esp8266_is_online()) {
+      return 1;
+    }
+  #endif
+
+  #ifdef EC20
+    if (ec20_is_online()) {
+      return 1;
+    }
+  #endif
+
+    return 0; // OFFLINE
+  }
+
+  uint32_t network_available() {
+    uint32_t available = 0;
+
+  #ifdef ESP8266
+    if (ring_available(&esp8266_tx) > available) {
+      available = ring_available(&esp8266_tx);
+    }
+  #endif
+
+  #ifdef EC20
+    if (ring_available(&ec20_tx) > available) {
+      available = ring_available(&ec20_tx);
+    }
+  #endif
+
+    return available;
+  }
+
+  void network_config_confirm(int16_t pin) {
+    parameter_t param;
+    bzero(&param, sizeof(parameter_t));
+    param.sn = sn ++;
+    param.cmd_type = CONFIG_NETWORK;
+    param.pin = pin;
+    param.rssi = network_rssi;
+    param.ber = network_ber;
+    param.reply_time = network_reply_time;
+    param.ttl = network_ttl;
+    param.network_reset = (int) network_reset_times;
+    param.network_shutdown = (int) network_shutdown_times;
+    uint8_t param_size = packet_calculate_encode_size(&param);
+    uint8_t buf[param_size];
+    uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
+    network_write(buf, bufsize);
+  }
+#+end_src
+
+** EC20
+*** 程序框架
+#+begin_src c :tangle /dev/shm/boxos/ec20.h
+  #ifndef _EC20_H
+  #define _EC20_H
+  #include <stdint.h>
+  #include "ring.h"
+
+  extern uint32_t ec20_state;
+  extern struct ring_t ec20_tx;
+  extern struct ring_t ec20_rx;
+
+  void ec20_setup(void);
+  void ec20_start(void);
+  void ec20_eventloop(void);
+  void ec20_write(uint8_t * data, uint32_t size);
+  uint8_t ec20_is_online(void);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/ec20.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "ec20.h"
+  #include "network.h"
+  #include "defination.h"
+  #include "console.h"
+  #include "base64.h"
+  #include "utility.h"
+  #include "packet.h"
+  #include "charger.h"
+  #include "led.h"
+  #include "ec20-fsm.h"
+  #include "ec20-syntax-fsm.h"
+  #include "at-lex-fsm.h"
+  #include "stack.h"
+
+  #define RETRY 10
+
+  #define EC20_BUFFER_BITSIZE 8
+  #define EC20_SEND_BUFFER_BITSIZE 10
+  #define EC20_STACK_BUFFER_BITSIZE 10
+
+  #define ec20_cmd(cmd) do {                                              \
+      ring_write(&ec20_send, sizeof(cmd"\r") - 1);                        \
+      ring_write_array(&ec20_send, (uint8_t *)cmd"\r", 0, sizeof(cmd"\r") - 1); \
+    } while (0)
+
+  struct ec20_parser_ctx_t {
+    uint8_t token[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
+    uint8_t ptr;
+    uint8_t input;
+  };
+
+  #define ec20_lex_clear_token(ctx) do {                          \
+      bzero(ctx->token, 2 << (EC20_SEND_BUFFER_BITSIZE - 1));     \
+      ctx->ptr = 0;                                               \
+    } while (0)
+
+  #define check_timeout_with_retry(cmd, timeout) do {                     \
+      if (systick - cmd##_timer > timeout) {                              \
+        if (cmd##_retry == 0) {                                           \
+          cmd##_retry = RETRY;                                            \
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL); \
+        } else {                                                          \
+          cmd##_retry --;                                                 \
+          ec20_state = ec20_transform_state(ec20_state, EC20_OP0_TIMEOUT_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL); \
+        }                                                                 \
+      }                                                                   \
+    } while (0)
+
+  uint32_t ec20_state = EC20_INITIAL_STATE;
+  uint32_t ec20_syntax_state = EC20_SYNTAX_INITIAL_STATE;
+  uint32_t ec20_lex_state = AT_LEX_INITIAL_STATE;
+
+  struct ring_t ec20_tx;
+  struct ring_t ec20_rx;
+  static struct ring_t ec20_send;
+  static struct stack_t ec20_stack;
+  struct ec20_parser_ctx_t ec20_parser_ctx;
+
+  static uint8_t ec20_tx_buffer[2 << (EC20_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_rx_buffer[2 << (EC20_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_send_buffer[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_stack_buffer[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
+
+  static uint8_t ec20_rssi = 0;
+  static uint8_t ec20_ber = 0;
+  static uint32_t ec20_reset_times = 0;
+  static uint32_t ec20_shutdown_times = 0;
+
+  /*
+    send buffer layout:
+
+            +-+-+-+-+-+-+-+-+
+    byte 0  |x|x|x|x|x|x|x|x|   length of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |x|x|x|x|x|x|x|x|   data 0
+            +-+-+-+-+-+-+-+-+
+                    .
+                    .
+                    .
+            +-+-+-+-+-+-+-+-+
+    byte n  |x|x|x|x|x|x|x|x|   data m
+            +-+-+-+-+-+-+-+-+
+  ,*/
+
+  volatile uint8_t ec20_length_to_send = 0; // A counter to indicate how many bytes to send to ec20
+  static uint8_t is_online = 0;
+  static uint32_t loop_timer = 0;
+  static uint32_t tx_timer = 0;
+  static uint32_t rx_timer = 0;
+  static uint32_t reset_timer = 0;
+  static uint32_t power_off_timer = 0;
+  static uint32_t idle_timer = 0;
+  static uint32_t cpin_timer = 0; // 5 s, 5000 ms
+  static uint32_t csq_idle_timer = 0; // retry interval 1s
+  static uint32_t csq_timer = 0; // 300 ms
+  static uint32_t creg_idle_timer = 0; // retry interval 1s
+  static uint32_t creg_timer = 0; // 300 ms
+  static uint32_t cgreg_idle_timer = 0; // retry interval 1s
+  static uint32_t cgreg_timer = 0; // 300 ms
+  static uint32_t qicsgp_timer = 0; // 1 s, 1000 ms
+  static uint32_t qiact_timer = 0; // 150 s, 150000 ms
+  static uint32_t qiopen_timer = 0; // 150 s, 150000 ms
+  static uint32_t qiclose_timer = 0; // 10 s, 10000 ms
+  static uint32_t qideact_timer = 0; // 40 s, 40000 ms
+
+  static uint8_t cpin_retry = RETRY;
+  static uint8_t csq_retry = RETRY;
+  static uint8_t creg_retry = RETRY;
+  static uint8_t cgreg_retry = RETRY;
+  static uint8_t qicsgp_retry = RETRY;
+  static uint8_t qiact_retry = RETRY;
+  static uint8_t qiopen_retry = RETRY;
+  static uint8_t qiclose_retry = RETRY;
+  static uint8_t qideact_retry = RETRY;
+
+  static char hexchar[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+
+  static void byte2hexstr(uint8_t * dst, uint32_t size, uint8_t * src, uint32_t len) {
+    if (size < len * 2) {
+      return;
+    }
+
+    bzero(dst, size);
+    for (uint16_t i = 0; i < len; i ++) {
+      dst[i << 1] = hexchar[(src[i] >> 4) & 0x0F];
+      dst[(i << 1) + 1] = hexchar[src[i] & 0x0F];
+    }
+  }
+
+  static void ec20_reset_retry(void) {
+    cpin_retry = RETRY;
+    csq_retry = RETRY;
+    creg_retry = RETRY;
+    cgreg_retry = RETRY;
+    qicsgp_retry = RETRY;
+    qiact_retry = RETRY;
+    qiopen_retry = RETRY;
+    qiclose_retry = RETRY;
+    qideact_retry = RETRY;
+  }
+
+  <<ec20-setup>>
+
+  void ec20_start(void) {
+    ec20_reset_retry();
+    is_online = 0;
+    led_off();
+    bzero(&ec20_parser_ctx, sizeof(struct ec20_parser_ctx_t));
+
+    gpio_set(EC20_POWER_PORT, EC20_POWER_IO);
+    delay(500);
+    gpio_clear(EC20_POWER_PORT, EC20_POWER_IO);
+    gpio_clear(EC20_RESET_PORT, EC20_RESET_IO);
+    delay(500);
+    gpio_set(EC20_RESET_PORT, EC20_RESET_IO);
+  }
+
+
+  inline uint8_t ec20_is_online(void) {
+    return is_online;
+  }
+  <<ec20-write>>
+  <<ec20-mainloop>>
+  <<ec20-fsm>>
+  <<ec20-syntax-fsm>>
+  <<ec20-lex-fsm>>
+  <<ec20-isr>>
+#+end_src
+*** 配置
+#+begin_src c :noweb-ref ec20-setup
+  void ec20_setup(void) {
+    ring_init(&ec20_tx, ec20_tx_buffer, EC20_BUFFER_BITSIZE);
+    ring_init(&ec20_rx, ec20_rx_buffer, EC20_BUFFER_BITSIZE + 0);
+    ring_init(&ec20_send, ec20_send_buffer, EC20_SEND_BUFFER_BITSIZE);
+    stack_init(&ec20_stack, ec20_stack_buffer, 2 << (EC20_SEND_BUFFER_BITSIZE - 1));
+
+    rcc_periph_clock_enable(EC20_RCC_GPIO);
+    rcc_periph_clock_enable(EC20_RCC);
+    rcc_periph_clock_enable(EC20_RESET_RCC);
+    rcc_periph_clock_enable(EC20_POWER_RCC);
+
+    /* Enable the USART EC20 interrupt. */
+    nvic_enable_irq(EC20_NVIC_IRQ);
+
+    gpio_set_mode(EC20_PORT, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, EC20_TX_IO);
+    gpio_set_mode(EC20_PORT, GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, EC20_RX_IO);
+    gpio_set_mode(EC20_RESET_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, EC20_RESET_IO);
+    gpio_set_mode(EC20_POWER_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, EC20_POWER_IO);
+
+    /* Setup UART parameters. */
+    usart_set_baudrate(EC20_USART, 115200);
+    usart_set_databits(EC20_USART, 8);
+    usart_set_stopbits(EC20_USART, USART_STOPBITS_1);
+    usart_set_mode(EC20_USART, USART_MODE_TX_RX);
+    usart_set_parity(EC20_USART, USART_PARITY_NONE);
+    usart_set_flow_control(EC20_USART, USART_FLOWCONTROL_NONE);
+
+    /* Enable EC20 Receive interrupt. */
+    USART_CR1(EC20_USART) |= USART_CR1_RXNEIE;
+
+    /* Finally enable the USART. */
+    usart_enable(EC20_USART); // for ec20
+  }
+#+end_src
+*** 主循环
+#+begin_src c :noweb-ref ec20-mainloop
+  void ec20_eventloop(void) {
+    if (systick > loop_timer) {
+      loop_timer = systick + 999; // interval of one second
+      int dayseconds = ((timestamp + zone) / 1000) % 86400;
+      if (dayseconds > 86397) {
+        ec20_reset_times = 0;
+        ec20_shutdown_times = 0;
+      }
+      if (ec20_state == EC20_QIOPEN_OKAY_STATE) {
+        if (((systick >> 7) & network_heart_rate) == 5) {
+          parameter_t param;
+          bzero(&param, sizeof(parameter_t));
+          param.sn = sn ++;
+          param.rssi = ec20_rssi;
+          param.ber = ec20_ber;
+          param.reply_time = network_reply_time;
+          param.ttl = network_ttl;
+          param.network_reset = (int) ec20_reset_times;
+          param.network_shutdown = (int) ec20_shutdown_times;
+          param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+          param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+          param.fireware_version |= (1 << (4 + 16));
+  #endif
+          param.fireware_version |= (1 << (2 + 16));
+          uint8_t pingsize = packet_calculate_encode_size(&param);
+          uint8_t buf[pingsize];
+          uint8_t bufsize = packet_encode(PING, uid, &param, buf, pingsize);
+          ec20_write(buf, bufsize);
+        } else if (((systick >> 7) & 63) == 10) {
+          ec20_cmd("AT+CSQ");
+        }
+        if (systick - idle_timer > network_timeout) {
+          console_log("Reconnect EC20 for no response in ");
+          console_number(network_timeout / 1000);
+          console_string(" seconds\r\n");
+          ec20_state = ec20_transform_state(ec20_state, EC20_IDLE_TIMEOUT_EVENT, NULL);
+          led_off();
+          is_online = 0;
+          idle_timer = systick;
+        }
+      } else if (ec20_state == EC20_POWER_OFF_STATE) {
+        if (systick - power_off_timer > 499) { // repower ec20 in 500 ms
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        }
+      } else if (ec20_state == EC20_RESETING_STATE) {
+        if (systick - reset_timer > 499) { // reset ec20 in 500 ms
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        }
+      } else if (ec20_state == EC20_ATE_OKAY_STATE) {
+        check_timeout_with_retry(cpin, 4999); // 5 s
+      } else if (ec20_state == EC20_CPIN_READY_STATE) {
+        check_timeout_with_retry(csq, 299); // 300ms
+      } else if (ec20_state == EC20_CSQ_ERROR_STATE) {
+        check_timeout_with_retry(csq, 299); // 300ms
+      } else if (ec20_state == EC20_CSQ_IDLE_STATE) {
+        if (systick - csq_idle_timer > 999) { // retry in 1s
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        }
+      } else if (ec20_state == EC20_CREG_OKAY_STATE) {
+        check_timeout_with_retry(cgreg, 149999); // 150s
+      } else if (ec20_state == EC20_CREG_ERROR_STATE) {
+        check_timeout_with_retry(creg, 299); // 300ms
+      } else if (ec20_state == EC20_CREG_IDLE_STATE) {
+        if (systick - creg_idle_timer > 999) { // retry in 1s
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        }
+      } else if (ec20_state == EC20_CGREG_OKAY_STATE) {
+        check_timeout_with_retry(qicsgp, 999); // 1s
+      } else if (ec20_state == EC20_CGREG_ERROR_STATE) {
+        check_timeout_with_retry(cgreg, 299); // 300ms
+      } else if (ec20_state == EC20_CGREG_IDLE_STATE) {
+        if (systick - cgreg_idle_timer > 999) { // retry in 1s
+          ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        }
+      } else if (ec20_state == EC20_QICSGP_OKAY_STATE) {
+        // check qiopen-timer and qiact-timer at the same time
+        if (systick - qiopen_timer > 149999) { // 150s
+          if (qiopen_retry == 0) {
+            qiopen_retry = RETRY;
+            ec20_state = ec20_transform_state(ec20_state, EC20_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+          } else {
+            qiopen_retry --;
+            ec20_state = ec20_transform_state(ec20_state, EC20_OP1_TIMEOUT_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+          }
+        } else {
+          check_timeout_with_retry(qiact, 149999); // 150s
+        }
+      } else if (ec20_state == EC20_QICSGP_ERROR_STATE) {
+        check_timeout_with_retry(qicsgp, 999); // 1s
+      } else if (ec20_state == EC20_QIACT_OKAY_STATE) {
+        check_timeout_with_retry(qiopen, 149999); // 150s
+      } else if (ec20_state == EC20_QIACT_ERROR_STATE) {
+        check_timeout_with_retry(qiact, 149999); // 150s
+      } else if (ec20_state == EC20_QIOPEN_ERROR_STATE) {
+        check_timeout_with_retry(qiopen, 149999); // 150s
+      } else if (ec20_state == EC20_QICLOSE_STATE) {
+        check_timeout_with_retry(qiclose, 9999); // 10s
+      } else if (ec20_state == EC20_QICLOSE_OKAY_STATE) {
+        check_timeout_with_retry(qiopen, 149999); // 150s
+      } else if (ec20_state == EC20_QICLOSE_ERROR_STATE) {
+        check_timeout_with_retry(qiclose, 9999); // 10s
+      } else if (ec20_state == EC20_QIDEACT_STATE) {
+        check_timeout_with_retry(qideact, 39999); // 40s
+      } else if (ec20_state == EC20_QIDEACT_OKAY_STATE) {
+        check_timeout_with_retry(qiact, 149999); // 150s
+      } else if (ec20_state == EC20_QIDEACT_ERROR_STATE) {
+        check_timeout_with_retry(qideact, 39999); // 40s
+      } else {
+        is_online = 0;
+        led_off();
+      }
+    }
+    if (systick > tx_timer) {
+      tx_timer = systick + 99; // interval of 100ms
+
+      if (ec20_length_to_send == 0) {
+        if (ring_length(&ec20_send) > 1) {
+          uint8_t len = 0;
+          if (ring_at(&ec20_send, 0, &len) == 1) {
+            if (ring_available(&ec20_tx) >= len) {
+              ring_pop(&ec20_send, 1);
+              uint8_t buf[len];
+              if (ring_read_array(&ec20_send, buf, 0, len) != 0) {
+                ring_write_array(&ec20_tx, buf, 0, len);
+                ec20_length_to_send = len;
+                USART_CR1(EC20_USART) |= USART_CR1_TXEIE;
+              }
+            }
+          }
+        } else {
+          USART_CR1(EC20_USART) &= ~USART_CR1_TXEIE;
+        }
+      } else {
+        USART_CR1(EC20_USART) |= USART_CR1_TXEIE;
+      }
+    }
+
+    uint32_t rxlen = ring_length(&ec20_rx);
+    if (rxlen > 0) {
+      rx_timer = systick + 149999;
+      for (uint32_t i = 0; i < rxlen; i ++) {
+        uint8_t byte;
+        ring_read(&ec20_rx, &byte);
+        ec20_parser_ctx.input = byte;
+        switch (byte) {
+        case 'a': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_A_EVENT, &ec20_parser_ctx); break;
+        case 'b': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_B_EVENT, &ec20_parser_ctx); break;
+        case 'c': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_C_EVENT, &ec20_parser_ctx); break;
+        case 'd': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_D_EVENT, &ec20_parser_ctx); break;
+        case 'e': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_E_EVENT, &ec20_parser_ctx); break;
+        case 'f': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_F_EVENT, &ec20_parser_ctx); break;
+        case 'x': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_X_EVENT, &ec20_parser_ctx); break;
+        case '0': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_0_EVENT, &ec20_parser_ctx); break;
+        case '1': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_1_EVENT, &ec20_parser_ctx); break;
+        case '2': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_2_EVENT, &ec20_parser_ctx); break;
+        case '3': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_3_EVENT, &ec20_parser_ctx); break;
+        case '4': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_4_EVENT, &ec20_parser_ctx); break;
+        case '5': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_5_EVENT, &ec20_parser_ctx); break;
+        case '6': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_6_EVENT, &ec20_parser_ctx); break;
+        case '7': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_7_EVENT, &ec20_parser_ctx); break;
+        case '8': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_8_EVENT, &ec20_parser_ctx); break;
+        case '9': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_9_EVENT, &ec20_parser_ctx); break;
+        case ' ': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_SPC_EVENT, &ec20_parser_ctx); break;
+        case ':': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_COLON_EVENT, &ec20_parser_ctx); break;
+        case ',': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_COMMA_EVENT, &ec20_parser_ctx); break;
+        case '>': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_GREATER_THAN_EVENT, &ec20_parser_ctx); break;
+        case '"': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_DOUBLE_QUOTES_EVENT, &ec20_parser_ctx); break;
+        case '\r': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_CR_EVENT, &ec20_parser_ctx); break;
+        case '\n': ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_LF_EVENT, &ec20_parser_ctx); break;
+        default: ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_OTHERS_EVENT, &ec20_parser_ctx); break;
+        }
+      }
+      USART_CR1(EC20_USART) |= USART_CR1_RXNEIE; // allow to receive data from ec20
+    }
+
+    if (systick > rx_timer) { // 150 s
+      ec20_lex_state = at_lex_transform_state(ec20_lex_state, AT_LEX_EOF_EVENT, &ec20_parser_ctx);
+      rx_timer = systick + 149999;
+    }
+  }
+#+end_src
+*** 核心状态机
+#+begin_src c :noweb-ref ec20-fsm
+  void ec20_do_action(enum EC20_ACTION action, void * data) {
+    (void)data;
+    switch (action) {
+    case EC20_POWER_OFF_ACTION:
+      gpio_set(EC20_POWER_PORT, EC20_POWER_IO);
+      power_off_timer = systick;
+      console_log("POWER OFF ACTION\r\n");
+      break;
+    case EC20_POWER_ON_ACTION:
+      gpio_clear(EC20_POWER_PORT, EC20_POWER_IO);
+      ec20_reset_times ++;
+      gpio_clear(EC20_RESET_PORT, EC20_RESET_IO);
+      reset_timer = systick;
+      break;
+    case EC20_INITIAL_ACTION:
+      gpio_set(EC20_RESET_PORT, EC20_RESET_IO);
+      ec20_reset_retry();
+      ec20_length_to_send = 0;
+      ring_empty(&ec20_rx);
+      ring_empty(&ec20_tx);
+      ring_empty(&ec20_send);
+      stack_clear(&ec20_stack);
+      console_log("INITIAL ACTION\r\n");
+      break;
+    case EC20_AT_ACTION:
+      ec20_cmd("AT");
+      break;
+    case EC20_ATE_ACTION:
+      ec20_cmd("ATE0");
+      break;
+    case EC20_AT_PLUS_CPIN_QUESTION_ACTION:
+      ec20_cmd("AT+CPIN?");
+      cpin_timer = systick;
+      break;
+    case EC20_AT_PLUS_CSQ_ACTION:
+      ec20_cmd("AT+CSQ");
+      break;
+    case EC20_AT_PLUS_CREG_QUESTION_ACTION:
+      ec20_cmd("AT+CREG?");
+      creg_idle_timer = systick + 30; // skip cmd timeout 300ms
+      creg_timer = systick;
+      break;
+    case EC20_AT_PLUS_CGREG_QUESTION_ACTION:
+      ec20_cmd("AT+CGREG?");
+      cgreg_idle_timer = systick + 30; // skip cmd timeout 300ms
+      cgreg_timer = systick;
+      break;
+    case EC20_AT_PLUS_QIACT_ACTION:
+      ec20_cmd("AT+QIACT=1");
+      qiact_timer = systick;
+      break;
+    case EC20_AT_PLUS_QICSGP_ACTION:
+      //ec20_cmd("AT+QICSGP=1,1,\"" QUOTE(APN) "\"");
+      ec20_cmd("AT+QICSGP=1,1");
+      qicsgp_timer = systick;
+      break;
+    case EC20_AT_PLUS_QIOPEN_ACTION:
+      ec20_cmd("AT+QIOPEN=1,0,\"UDP\",\"" QUOTE(SERVICE_DOMAIN) "\"," QUOTE(SERVICE_PORT) ",0,1");
+      qiopen_timer = systick;
+      break;
+    case EC20_NETWORK_READ_CALLBACK_ACTION: {
+      idle_timer = systick;
+      is_online = 1;
+      led_on();
+      uint8_t * len = ((uint8_t **) data)[0];
+      uint8_t * buf = ((uint8_t **) data)[1];
+      network_read_callback(buf, * len);
+      break;
+    }
+    case EC20_AT_PLUS_QICLOSE_ACTION:
+      ec20_cmd("AT+QICLOSE=0");
+      qiclose_timer = systick;
+      break;
+    case EC20_AT_PLUS_QIDEACT_ACTION:
+      ec20_cmd("AT+QIDEACT=1");
+      qideact_timer = systick;
+      ec20_shutdown_times ++;
+      break;
+    case EC20_CONNECTED_ACTION:
+      network_notify_connected();
+      break;
+    }
+  }
+#+end_src
+*** 语法状态机
+#+begin_src c :noweb-ref ec20-syntax-fsm
+  void ec20_syntax_do_action(enum EC20_SYNTAX_ACTION action, void * data) {
+    switch (action) {
+    case EC20_SYNTAX_SYNTAX_ERROR_ACTION: break; // ignore it
+    case EC20_SYNTAX_ERROR_ACTION:
+      switch (ec20_state) {
+      case EC20_QICSGP_ERROR_STATE:
+        if (qicsgp_retry == 0) {
+          qicsgp_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          qicsgp_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+        break;
+      case EC20_QIACT_ERROR_STATE:
+        if (qiact_retry == 0) {
+          qiact_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          qiact_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+        break;
+      case EC20_QICLOSE_ERROR_STATE: {
+        if (qiclose_retry == 0) {
+          qiclose_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          qiclose_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+        break;
+      }
+      case EC20_QIDEACT_ERROR_STATE:
+        if (qideact_retry == 0) {
+          qideact_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          qideact_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+        break;
+      default:
+        ec20_state = ec20_transform_state(ec20_state, EC20_ERROR_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        break;
+      }
+      break;
+    case EC20_SYNTAX_OK_ACTION:
+      ec20_state = ec20_transform_state(ec20_state, EC20_OK_EVENT, NULL);
+      break;
+    case EC20_SYNTAX_PUSH_NUMBER_ACTION: {
+      uint32_t * num = (uint32_t * )data;
+      stack_push(&ec20_stack, (* num) & 0xFF);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CPIN_READY_ACTION: {
+      ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CPIN_COLON_READY_EVENT, NULL);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CGREG_COLON_N_COMMA_STAT_ACTION: {
+      uint8_t stat = 0;
+      stack_top(&ec20_stack, &stat);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+      if (stat == 1) {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CGREG_COLON_X_COMMA_1_EVENT, NULL);
+      } else {
+        if (cgreg_retry == 0) {
+          cgreg_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CGREG_COLON_X_COMMA_0_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          cgreg_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CGREG_COLON_X_COMMA_0_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIOPEN_COLON_CONNECTID_COMMA_ERR_ACTION: {
+      uint8_t connectid = 0;
+      uint8_t err = 0;
+      stack_top(&ec20_stack, &err);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &connectid);
+      stack_pop(&ec20_stack);
+      if (err == 0) {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_QIOPEN_COLON_X_COMMA_0_EVENT, NULL);
+        console_log("Change systick from ");
+        console_number(systick);
+        console_string(" to ");
+        systick += (network_heart_rate - 1 - ((systick >> 7) & network_heart_rate)) << 7;
+        console_number(systick);
+        console_newline();
+      } else {
+        if (qiopen_retry == 0) {
+          qiopen_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_QIOPEN_COLON_X_COMMA_X_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          qiopen_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_QIOPEN_COLON_X_COMMA_X_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CME_ERROR_ACTION:
+      ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CME_ERROR_EVENT, NULL);
+      break;
+    case EC20_SYNTAX_PLUS_CME_ERROR_CODE_ACTION: {
+      uint8_t code = 0;
+      stack_top(&ec20_stack, &code);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+      if (code == 14) {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CME_ERROR_14_EVENT, NULL);
+      } else {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CME_ERROR_EVENT, &code);
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CREG_COLON_N_COMMA_STAT_ACTION: {
+      uint8_t stat = 0;
+      stack_top(&ec20_stack, &stat);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+      if (stat == 1) {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CREG_COLON_X_COMMA_1_EVENT, NULL);
+      } else {
+        if (creg_retry == 0) {
+          creg_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CREG_COLON_X_COMMA_0_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          creg_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CREG_COLON_X_COMMA_0_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CSQ_COLON_RSSI_COMMA_BER_ACTION: {
+      stack_top(&ec20_stack, &ec20_ber);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &ec20_rssi);
+      stack_pop(&ec20_stack);
+      if (ec20_rssi == 99) {
+        if (csq_retry == 0) {
+          csq_retry = RETRY;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CSQ_COLON_99_COMMA_XX_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          csq_retry --;
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CSQ_COLON_99_COMMA_XX_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      } else {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_CSQ_COLON_XX_COMMA_XX_EVENT, &ec20_rssi);
+      }
+      break;
+    }
+    case EC20_SYNTAX_RDY_ACTION:
+      ec20_state = ec20_transform_state(ec20_state, EC20_RDY_EVENT, NULL);
+      break;
+    case EC20_SYNTAX_PUSH_STRING_ACTION: {
+      uint8_t * len = ((uint8_t **)data)[1];
+      uint8_t * dat = ((uint8_t **)data)[0];
+      for (uint8_t i = * len - 1; i != 0xFF; i --) {
+        stack_push(&ec20_stack, dat[i]);
+      }
+      stack_push(&ec20_stack,  (* len) & 0xFF);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIURC_COLON_STR_COMMA_ID_ACTION: {
+      stack_pop(&ec20_stack); // pop contextid
+      uint8_t strlen = 0;
+      stack_top(&ec20_stack, &strlen); // length of string
+      uint8_t buf[strlen + 1];
+      bzero(buf, strlen + 1);
+      stack_pop(&ec20_stack); // pop length of string
+      for (uint8_t i = 0; i < strlen; i ++) {
+        stack_top(&ec20_stack, buf + i);
+        stack_pop(&ec20_stack); // pop string
+      }
+
+      if (strlen == 8 &&
+          buf[0] == 'p' &&
+          buf[1] == 'd' &&
+          buf[2] == 'p' &&
+          buf[3] == 'd' &&
+          buf[4] == 'e' &&
+          buf[5] == 'a' &&
+          buf[6] == 'c' &&
+          buf[7] == 't') {
+        ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_QIURC_COLON_DOUBLE_QUOTES_PDPDEACT_DOUBLE_QUOTES_COMMA_CONTEXTID_EVENT, NULL);
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIURC_COLON_STR_COMMA_ID_COMMA_LENGTH_COMMA_DATA_ACTION: {
+      uint8_t * tlen = ((uint8_t **)data)[1];
+      uint8_t * token = ((uint8_t **)data)[0];
+
+      uint8_t * dat[2];
+      dat[0] = tlen;
+      dat[1] = token;
+      uint8_t len = 0;
+      stack_top(&ec20_stack, &len);
+      stack_pop(&ec20_stack); // pop length
+      stack_pop(&ec20_stack); // pop connectid
+      uint8_t strlen = 0;
+      stack_top(&ec20_stack, &strlen); // length of string
+      stack_pop(&ec20_stack); // pop length of string
+      for (uint8_t i = 0; i < strlen; i ++) {
+        stack_pop(&ec20_stack); // pop string
+      }
+      if (len == *tlen) {
+        if (strlen == 4) {
+          ec20_state = ec20_transform_state(ec20_state, EC20_PLUS_QIURC_COLON_DOUBLE_QUOTES_RECV_DOUBLE_QUOTES_COMMA_CONNECTID_COMMA_LENGTH_NEWLINE_DATA_EVENT, dat);
+        }
+      }
+      break;
+    }
+    }
+  }
+#+end_src
+*** 词法状态机
+#+begin_src c :noweb-ref ec20-lex-fsm
+  void at_lex_do_action(enum AT_LEX_ACTION action, void * data) {
+    struct ec20_parser_ctx_t * ctx = (struct ec20_parser_ctx_t *) data;
+    switch (action) {
+    case AT_LEX_APPEND_ACTION:
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    case AT_LEX_GREATER_THAN_ACTION:
+      break;
+    case AT_LEX_CR_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+      break;
+    case AT_LEX_LF_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+      break;
+    case AT_LEX_EOF_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+      break;
+    case AT_LEX_NUMBER_NEWLINE_APPEND_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->token, ctx->ptr);
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_NUMBER_EVENT, &num);
+      ec20_lex_clear_token(ctx);
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    }
+    case AT_LEX_NUMBER_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_CR_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_LF_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_EOF_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->token, ctx->ptr);
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_NUMBER_EVENT, &num);
+      ec20_lex_clear_token(ctx);
+      if (action == AT_LEX_NUMBER_NEWLINE_CR_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+      } else if (action == AT_LEX_NUMBER_NEWLINE_LF_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+      } else if (action == AT_LEX_NUMBER_NEWLINE_EOF_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+      }
+      break;
+    }
+    case AT_LEX_HEX_NEWLINE_APPEND_ACTION:
+      // skip hex
+      ec20_lex_clear_token(ctx);
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    case AT_LEX_STRING_ACTION:
+    case AT_LEX_STRING_NEWLINE_EOF_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->token;
+      tmp[1] = (uint8_t *) &ctx->ptr;
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_STRING_EVENT, tmp);
+      ec20_lex_clear_token(ctx);
+      if (action == AT_LEX_STRING_NEWLINE_EOF_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, tmp);
+      }
+      break;
+    }
+    case AT_LEX_TOKEN_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_CR_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_LF_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_EOF_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->token;
+      tmp[1] = (uint16_t *) &ctx->ptr;
+      if (ctx->ptr == 6 &&
+          ctx->token[0] == '+' &&
+          ctx->token[1] == 'Q' &&
+          ctx->token[2] == 'I' &&
+          ctx->token[3] == 'U' &&
+          ctx->token[4] == 'R' &&
+          ctx->token[5] == 'C') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QIURC_EVENT, NULL);
+      } else if (ctx->ptr == 3 &&
+          ctx->token[0] == 'R' &&
+          ctx->token[1] == 'D' &&
+          ctx->token[2] == 'Y') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_RDY_EVENT, NULL);
+      } else if (ctx->ptr == 2 &&
+                 ctx->token[0] == 'O' &&
+                 ctx->token[1] == 'K') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_OK_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == 'E' &&
+                 ctx->token[1] == 'R' &&
+                 ctx->token[2] == 'R' &&
+                 ctx->token[3] == 'O' &&
+                 ctx->token[4] == 'R') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_ERROR_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == 'R' &&
+                 ctx->token[1] == 'E' &&
+                 ctx->token[2] == 'A' &&
+                 ctx->token[3] == 'D' &&
+                 ctx->token[4] == 'Y') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_READY_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'S' &&
+                 ctx->token[1] == 'E' &&
+                 ctx->token[2] == 'N' &&
+                 ctx->token[3] == 'D') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_SEND_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'F' &&
+                 ctx->token[1] == 'A' &&
+                 ctx->token[2] == 'I' &&
+                 ctx->token[3] == 'L') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_FAIL_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'D' &&
+                 ctx->token[1] == 'O' &&
+                 ctx->token[2] == 'N' &&
+                 ctx->token[3] == 'E') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_DONE_EVENT, NULL);
+      } else if (ctx->ptr == 3 &&
+                 ctx->token[0] == 'S' &&
+                 ctx->token[1] == 'M' &&
+                 ctx->token[2] == 'S') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_SMS_EVENT, NULL);
+      } else if (ctx->ptr == 2 &&
+                 ctx->token[0] == 'P' &&
+                 ctx->token[1] == 'B') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PB_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'F' &&
+                 ctx->token[3] == 'U' &&
+                 ctx->token[4] == 'N') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CFUN_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'G' &&
+                 ctx->token[3] == 'R' &&
+                 ctx->token[4] == 'E' &&
+                 ctx->token[5] == 'G') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CGREG_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'M' &&
+                 ctx->token[3] == 'E') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CME_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'P' &&
+                 ctx->token[3] == 'I' &&
+                 ctx->token[4] == 'N') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CPIN_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'R' &&
+                 ctx->token[3] == 'E' &&
+                 ctx->token[4] == 'G') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CREG_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'C' &&
+                 ctx->token[2] == 'S' &&
+                 ctx->token[3] == 'Q') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CSQ_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'Q' &&
+                 ctx->token[2] == 'I' &&
+                 ctx->token[3] == 'N' &&
+                 ctx->token[4] == 'D') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QIND_EVENT, NULL);
+      } else if (ctx->ptr == 7 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'Q' &&
+                 ctx->token[2] == 'I' &&
+                 ctx->token[3] == 'O' &&
+                 ctx->token[4] == 'P' &&
+                 ctx->token[5] == 'E' &&
+                 ctx->token[6] == 'N') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QIOPEN_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'Q' &&
+                 ctx->token[2] == 'I' &&
+                 ctx->token[3] == 'S' &&
+                 ctx->token[4] == 'I' &&
+                 ctx->token[5] == 'M') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QUSIM_EVENT, NULL);
+      } else {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_TOKEN_EVENT, tmp);
+      }
+      ec20_lex_clear_token(ctx);
+      if (action == AT_LEX_TOKEN_NEWLINE_CR_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+      } else if (action == AT_LEX_TOKEN_NEWLINE_LF_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+      } else if (action == AT_LEX_TOKEN_NEWLINE_EOF_ACTION) {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+      }
+      break;
+    }
+    }
+  }
+#+end_src
+*** 中断响应
+#+begin_src c :noweb-ref ec20-isr
+  void EC20_USART_ISR(void) {
+    uint8_t data = 0;
+    uint32_t result = 0;
+
+    /* Check if we were called because of RXNE. */
+    if (((USART_CR1(EC20_USART) & USART_CR1_RXNEIE) != 0) && ((USART_SR(EC20_USART) & USART_SR_RXNE) != 0)) {
+
+      /* Retrieve the data from the peripheral. */
+      data = usart_recv(EC20_USART);
+      ring_write( &ec20_rx, data);
+      if (ring_available(&ec20_rx) == 0) {
+        /* Disable the RXNEIE interrupt */
+        USART_CR1(EC20_USART) &= ~USART_CR1_RXNEIE;
+      }
+      console_char(data);
+    }
+
+    /* Check if we were called because of TXE. */
+    if (((USART_CR1(EC20_USART) & USART_CR1_TXEIE) != 0) && ((USART_SR(EC20_USART) & USART_SR_TXE) != 0)) {
+      if (ec20_length_to_send == 0) {
+        USART_CR1(EC20_USART) &= ~USART_CR1_TXEIE;
+        return;
+      }
+
+      result = ring_read(&ec20_tx, &data);
+
+      if (result == 0) {
+        /* Disable the TXE interrupt, it's no longer needed. */
+        USART_CR1(EC20_USART) &= ~USART_CR1_TXEIE;
+      } else {
+        /* Put data into the transmit register. */
+        usart_send(EC20_USART, data);
+        ec20_length_to_send --;
+        console_char(data);
+      }
+    }
+  }
+#+end_src
+
+*** 发送数据
+#+begin_src c :noweb-ref ec20-write
+  void ec20_write(uint8_t * data, uint32_t size) {
+    if (ec20_state == EC20_QIOPEN_OKAY_STATE) {
+      uint32_t base64_len = base64_encode_length(size);
+      uint8_t base64buf[base64_len];
+      base64_len = base64_encode(data, size, base64buf, base64_len);
+      if (base64_len == 0) return;
+      if (ring_available(&ec20_send) < base64_len * 2 + 17 + 1 /* len of len byte */) {
+        console_log("No enough spaces in ec20_send ringbuffer for ");
+        console_number(base64_len * 2 + 17 + 1);
+        console_string(" bytes\r\n");
+        return;
+      }
+      uint8_t buf[base64_len * 2 + 17 + 1];
+      buf[0] = base64_len * 2 + 17;
+      buf[1] = 'A';
+      buf[2] = 'T';
+      buf[3] = '+';
+      buf[4] = 'Q';
+      buf[5] = 'I';
+      buf[6] = 'S';
+      buf[7] = 'E';
+      buf[8] = 'N';
+      buf[9] = 'D';
+      buf[10] = 'E';
+      buf[11] = 'X';
+      buf[12] = '=';
+      buf[13] = '0';
+      buf[14] = ',';
+      buf[15] = '"';
+      byte2hexstr(buf + 16, base64_len << 1, base64buf, base64_len);
+      buf[15 + base64_len * 2 + 1] = '"';
+      buf[15 + base64_len * 2 + 2] = '\r';
+      ring_write_array(&ec20_send, buf, 0, base64_len * 2 + 17 + 1);
+    }
+  }
+#+end_src
+** ESP8266
+*** 程序框架
+#+begin_src c :tangle /dev/shm/boxos/esp8266.h
+  #ifndef _ESP8266_H
+  #define _ESP8266_H
+  #include <stdint.h>
+  #include "ring.h"
+
+  extern uint8_t esp8266_state;
+  extern struct ring_t esp8266_tx;
+  extern struct ring_t esp8266_rx;
+
+  void esp8266_setup(void);
+  void esp8266_start(void);
+  void esp8266_eventloop(void);
+  void esp8266_write(uint8_t * data, uint32_t size);
+  uint8_t esp8266_is_online(void);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/esp8266.c
+  #include <stdlib.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "esp8266.h"
+  #include "network.h"
+  #include "defination.h"
+  #include "console.h"
+  #include "base64.h"
+  #include "utility.h"
+  #include "packet.h"
+  #include "charger.h"
+  #include "led.h"
+  #include "fan.h"
+  #include "esp8266-fsm.h"
+  #include "esp8266-syntax-fsm.h"
+  #include "at-lex-fsm.h"
+  #include "stack.h"
+
+  #define RETRY 3
+
+  #define ESP8266_BUFFER_BITSIZE 8
+  #define ESP8266_SEND_BUFFER_BITSIZE 10
+  #define PACKET_LENGTHS_BUFFER_BITSIZE 3
+
+
+  #define esp8266_cmd(cmd) do {                                           \
+      console_log("["cmd"]\r\n");                                         \
+      ring_write(&esp8266_lengths, sizeof(cmd"\r\n") - 1);                \
+      ring_write_array(&esp8266_tx, (uint8_t *)cmd"\r\n", 0, sizeof(cmd"\r\n") - 1); \
+    } while (0)
+
+  struct esp8266_parser_ctx_t {
+    uint8_t token[2 << (ESP8266_SEND_BUFFER_BITSIZE - 1)];
+    uint16_t ptr;
+    uint8_t input;
+  };
+
+  #define esp8266_lex_clear_token(ctx) do {                       \
+      bzero(ctx->token, 2 << (ESP8266_SEND_BUFFER_BITSIZE - 1));  \
+      ctx->ptr = 0;                                               \
+    } while (0)
+
+  uint8_t esp8266_state = ESP8266_INITIAL_STATE;
+  uint32_t esp8266_syntax_state = ESP8266_SYNTAX_INITIAL_STATE;
+  uint32_t esp8266_lex_state = AT_LEX_INITIAL_STATE;
+
+  struct ring_t esp8266_tx;
+  struct ring_t esp8266_rx;
+  static struct ring_t esp8266_send;
+  static struct ring_t esp8266_lengths;
+  static struct stack_t esp8266_stack;
+  struct esp8266_parser_ctx_t esp8266_parser_ctx;
+
+  static uint8_t esp8266_lengths_buffer[2 << (PACKET_LENGTHS_BUFFER_BITSIZE - 1)];
+  static uint8_t esp8266_tx_buffer[2 << (ESP8266_BUFFER_BITSIZE - 1)];
+  static uint8_t esp8266_rx_buffer[2 << (ESP8266_BUFFER_BITSIZE + 2 - 1)];
+  static uint8_t esp8266_send_buffer[2 << (ESP8266_SEND_BUFFER_BITSIZE - 1)];
+  static uint8_t esp8266_stack_buffer[2 << (ESP8266_SEND_BUFFER_BITSIZE - 1)];
+
+  uint8_t esp8266_length_to_send = 0; // A counter to indicate how many bytes to send to esp8266
+  volatile uint8_t is_online = 0;
+
+  /*
+    send buffer layout:
+
+            +-+-+-+-+-+-+-+-+
+    byte 0  |x|x|x|x|x|x|x|x|   length of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |x|x|x|x|x|x|x|x|   data 0
+            +-+-+-+-+-+-+-+-+
+                    .
+                    .
+                    .
+            +-+-+-+-+-+-+-+-+
+    byte n  |x|x|x|x|x|x|x|x|   data m
+            +-+-+-+-+-+-+-+-+
+  ,*/
+
+
+  static uint32_t loop_timer = 0;
+  static uint32_t tx_timer = 0;
+  static uint32_t rx_timer = 0;
+  static uint32_t reset_timer = 0;
+  static uint32_t idle_timer = 0;
+  static uint32_t power_off_timer = 0;
+  static uint32_t cmd_timer = 0;
+  static uint32_t disable_timer = 0;
+  static uint32_t enable_timer = 0;
+  static uint32_t initial_timer = 0;
+
+  static uint8_t at_retry;
+  static uint8_t ate_retry;
+  static uint8_t cipstart_retry;
+  static uint8_t cipclose_retry;
+  static uint8_t rst_retry; // retry for AT+RST
+  static uint8_t reset_retry; // retry for RESET
+  static uint8_t waiting_greater_than_retry;
+
+  static void esp8266_reset_retry(void) {
+    at_retry = RETRY;
+    ate_retry = RETRY;
+    cipstart_retry = RETRY;
+    cipclose_retry = RETRY;
+    waiting_greater_than_retry = RETRY;
+    rst_retry = RETRY;
+    reset_retry = RETRY;
+  }
+
+  inline uint8_t esp8266_is_online(void) {
+    return is_online;
+  }
+
+  <<esp8266-setup>>
+  void esp8266_start(void) {
+    gpio_set(ESP8266_POWER_PORT, ESP8266_POWER_IO);
+    delay(100);
+    gpio_set(ESP8266_RESET_PORT, ESP8266_RESET_IO);
+
+    esp8266_reset_retry();
+  }
+
+  <<esp8266-mainloop>>
+  <<esp8266-write>>
+  <<esp8266-fsm>>
+  <<esp8266-syntax-fsm>>
+  <<esp8266-lex-fsm>>
+  <<esp8266-isr>>
+#+end_src
+*** 配置
+#+begin_src c :noweb-ref esp8266-setup
+  void esp8266_setup(void) {
+    ring_init(&esp8266_tx, esp8266_tx_buffer, ESP8266_BUFFER_BITSIZE);
+    ring_init(&esp8266_rx, esp8266_rx_buffer, ESP8266_BUFFER_BITSIZE + 2);
+    ring_init(&esp8266_send, esp8266_send_buffer, ESP8266_SEND_BUFFER_BITSIZE);
+    ring_init(&esp8266_lengths, esp8266_lengths_buffer, PACKET_LENGTHS_BUFFER_BITSIZE);
+    stack_init(&esp8266_stack, esp8266_stack_buffer, 2 << (ESP8266_SEND_BUFFER_BITSIZE - 1));
+
+    rcc_periph_clock_enable(ESP8266_RCC_GPIO);
+    rcc_periph_clock_enable(ESP8266_RCC);
+    rcc_periph_clock_enable(ESP8266_RESET_RCC);
+    rcc_periph_clock_enable(ESP8266_POWER_RCC);
+
+    /* Enable the USART ESP8266 interrupt. */
+    nvic_enable_irq(ESP8266_NVIC_IRQ);
+
+    gpio_set_mode(ESP8266_TX_PORT, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, ESP8266_TX_IO);
+    gpio_set_mode(ESP8266_RX_PORT, GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, ESP8266_RX_IO);
+    gpio_set_mode(ESP8266_RESET_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, ESP8266_RESET_IO);
+    gpio_set_mode(ESP8266_POWER_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, ESP8266_POWER_IO);
+
+    /* Setup UART parameters. */
+    usart_set_baudrate(ESP8266_USART, 115200);
+    usart_set_databits(ESP8266_USART, 8);
+    usart_set_stopbits(ESP8266_USART, USART_STOPBITS_1);
+    usart_set_mode(ESP8266_USART, USART_MODE_TX_RX);
+    usart_set_parity(ESP8266_USART, USART_PARITY_NONE);
+    usart_set_flow_control(ESP8266_USART, USART_FLOWCONTROL_NONE);
+
+    /* Enable ESP8266 Receive interrupt. */
+    USART_CR1(ESP8266_USART) |= USART_CR1_RXNEIE;
+
+    /* Finally enable the USART. */
+    usart_enable(ESP8266_USART); // for esp8266
+  }
+#+end_src
+*** 主循环
+#+begin_src c :noweb-ref esp8266-mainloop
+  void esp8266_eventloop(void) {
+    if (systick > loop_timer) { // interval of one second
+      loop_timer = systick + 999;
+      int dayseconds = ((timestamp + zone) / 1000) % 86400;
+      if (dayseconds > 86397) {
+        network_reset_times = 0;
+        network_shutdown_times = 0;
+      }
+
+      if (systick - power_off_timer > 599999) { // interval of 10 minutes
+        power_off_timer = systick;
+        esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_POWER_OFF_EVENT, NULL);
+      } else if (rst_retry == 0) {
+        rst_retry = RETRY;
+        esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_RST_RETRY_EQUALS_0_EVENT, NULL);
+      } else if (reset_retry == 0) {
+        reset_retry = RETRY;
+        esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_RESET_RETRY_EQUALS_0_EVENT, NULL);
+      } else if (esp8266_state == ESP8266_CIPSTART_OKAY_STATE) {
+        if (ring_length(&esp8266_send) > 1) {
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_SEND_EVENT, NULL);
+        } else if (((systick >> 7) & network_heart_rate) == 5) {
+          /*
+            uint8_t chargers[12];
+            for (uint8_t i = 0; i < 12; i ++) {
+            chargers[i] = charger_value(i);
+            }
+            ,,*/
+          parameter_t param;
+          bzero(&param, sizeof(parameter_t));
+          param.sn = sn ++;
+          param.rssi = network_rssi;
+          param.ber = network_ber;
+          //parameter_set_chargers(&param, chargers, 12);
+          param.reply_time = network_reply_time;
+          param.ttl = network_ttl;
+          param.network_reset = (int) network_reset_times;
+          param.network_shutdown = (int) network_shutdown_times;
+          param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+          param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+          param.fireware_version |= (1 << (4 + 16));
+  #endif
+          param.fireware_version |= (1 << (1 + 16));
+          uint8_t pingsize = packet_calculate_encode_size(&param);
+          uint8_t buf[pingsize];
+          uint8_t bufsize = packet_encode(PING, uid, &param, buf, pingsize);
+          esp8266_write(buf, bufsize);
+        }
+        if (systick - idle_timer > network_timeout) {
+          console_log("Reconnect ESP8266 for no response in ");
+          console_number(network_timeout / 1000);
+          console_string(" seconds \r\n");
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_IDLE_TIMEOUT_EVENT, NULL);
+          led_off();
+          is_online = 0;
+          idle_timer = systick;
+        } else {
+          console_log("Restart esp8266 after ");
+          console_number((network_timeout - (systick - idle_timer)) / 1000);
+          console_string(" seconds\r\n");
+        }
+      } else if (esp8266_state == ESP8266_WAIT_GREATER_THAN_STATE) {
+        if (systick - idle_timer > network_timeout) {
+          console_log("Reconnect ESP8266 for no response in ");
+          console_number(network_timeout / 1000);
+          console_string(" seconds \r\n");
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_IDLE_TIMEOUT_EVENT, NULL);
+          led_off();
+          is_online = 0;
+          idle_timer = systick;
+        } else {
+          console_log("Restart esp8266 after ");
+          console_number((network_timeout - (systick - idle_timer)) / 100);
+          console_string(" seconds\r\n");
+        }
+      } else if (esp8266_state == ESP8266_SENDING_STATE) {
+        if (systick - idle_timer > network_timeout) {
+          console_log("Reconnect ESP8266 for no response in ");
+          console_number(network_timeout / 1000);
+          console_string(" seconds \r\n");
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_IDLE_TIMEOUT_EVENT, NULL);
+          led_off();
+          is_online = 0;
+          idle_timer = systick;
+        } else {
+          console_log("Restart esp8266 after ");
+          console_number((network_timeout - (systick - idle_timer)) / 1000);
+          console_string(" seconds\r\n");
+        }
+      } else if (esp8266_state == ESP8266_DISABLED_STATE) {
+        if (systick - disable_timer > 99) { // 100 ms
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+          disable_timer = systick;
+        }
+      } else if (esp8266_state == ESP8266_ENABLED_STATE) {
+        if (systick - enable_timer > 99) { // 100 ms
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+          enable_timer = systick;
+        }
+      } else if (esp8266_state == ESP8266_RESETING_STATE) {
+        if (systick - reset_timer > 4999) { // reboot wifi router in 5 seconds
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+        }
+      } else if (esp8266_state == ESP8266_POWER_OFF_STATE) {
+        if (systick - power_off_timer > 4999) { // reboot wifi router in 5 seconds
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+        }
+      } else if (esp8266_state == ESP8266_INITIAL_STATE) {
+        if (systick - initial_timer > 4999) { // 5 seconds
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+          initial_timer = systick;
+        }
+      } else {
+        is_online = 0;
+        led_off();
+      }
+      if (cmd_timer != 0 && (systick - cmd_timer > 999)) { // Every AT command must be executed in 10 seconds
+        cmd_timer = 0;
+        if (esp8266_state == ESP8266_AT_STATE) {
+          if (at_retry == 0) {
+            at_retry = RETRY;
+            esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_AND_RETRY_EQUALS_0_EVENT, NULL);
+          } else {
+            at_retry --;
+            esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+          }
+        } else if (esp8266_state == ESP8266_ATE_OKAY_STATE) {
+          if (cipstart_retry == 0) {
+            cipstart_retry = RETRY;
+            esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_AND_RETRY_EQUALS_0_EVENT, NULL);
+          } else {
+            cipstart_retry --;
+            esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+          }
+        } else if (esp8266_state == ESP8266_WAIT_GREATER_THAN_STATE) {
+          if (waiting_greater_than_retry == 0) {
+            waiting_greater_than_retry = RETRY;
+            esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_AND_RETRY_EQUALS_0_EVENT, NULL);
+          } else {
+            waiting_greater_than_retry --;
+          }
+        } else {
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_TIMEOUT_EVENT, NULL);
+        }
+      }
+    }
+
+    uint32_t rxlen = ring_length(&esp8266_rx);
+    if (rxlen > 0) {
+      rx_timer = systick;
+      for (uint32_t i = 0; i < rxlen; i ++) {
+        uint8_t byte;
+        ring_read(&esp8266_rx, &byte);
+        esp8266_parser_ctx.input = byte;
+        switch (byte) {
+        case 'a': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_A_EVENT, &esp8266_parser_ctx); break;
+        case 'b': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_B_EVENT, &esp8266_parser_ctx); break;
+        case 'c': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_C_EVENT, &esp8266_parser_ctx); break;
+        case 'd': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_D_EVENT, &esp8266_parser_ctx); break;
+        case 'e': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_E_EVENT, &esp8266_parser_ctx); break;
+        case 'f': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_F_EVENT, &esp8266_parser_ctx); break;
+        case 'x': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_X_EVENT, &esp8266_parser_ctx); break;
+        case '0': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_0_EVENT, &esp8266_parser_ctx); break;
+        case '1': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_1_EVENT, &esp8266_parser_ctx); break;
+        case '2': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_2_EVENT, &esp8266_parser_ctx); break;
+        case '3': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_3_EVENT, &esp8266_parser_ctx); break;
+        case '4': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_4_EVENT, &esp8266_parser_ctx); break;
+        case '5': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_5_EVENT, &esp8266_parser_ctx); break;
+        case '6': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_6_EVENT, &esp8266_parser_ctx); break;
+        case '7': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_7_EVENT, &esp8266_parser_ctx); break;
+        case '8': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_8_EVENT, &esp8266_parser_ctx); break;
+        case '9': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_9_EVENT, &esp8266_parser_ctx); break;
+        case ' ': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_SPC_EVENT, &esp8266_parser_ctx); break;
+        case ':': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_COLON_EVENT, &esp8266_parser_ctx); break;
+        case ',': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_COMMA_EVENT, &esp8266_parser_ctx); break;
+        case '>': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_GREATER_THAN_EVENT, &esp8266_parser_ctx); break;
+        case '"': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_DOUBLE_QUOTES_EVENT, &esp8266_parser_ctx); break;
+        case '\r': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_CR_EVENT, &esp8266_parser_ctx); break;
+        case '\n': esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_LF_EVENT, &esp8266_parser_ctx); break;
+        default: esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_OTHERS_EVENT, &esp8266_parser_ctx); break;
+        }
+      }
+      USART_CR1(ESP8266_USART) |= USART_CR1_RXNEIE; // allow to receive data from esp8266
+    }
+
+    if (systick - rx_timer > 99) { // 100 ms
+      esp8266_lex_state = at_lex_transform_state(esp8266_lex_state, AT_LEX_EOF_EVENT, &esp8266_parser_ctx);
+      rx_timer = systick + 8640000 /* no need to fire eof event every seconds */;
+    }
+
+    if (systick - tx_timer > 9) { // 100ms
+      tx_timer = systick;
+      if (esp8266_length_to_send == 0) {
+        if (ring_length(&esp8266_lengths) > 0 && ring_length(&esp8266_tx) > 0) {
+          ring_read(&esp8266_lengths, &esp8266_length_to_send);
+          cmd_timer = systick;
+          USART_CR1(ESP8266_USART) |= USART_CR1_TXEIE;
+        }
+      } else {
+        USART_CR1(ESP8266_USART) |= USART_CR1_TXEIE;
+      }
+    }
+  }
+#+end_src
+*** 核心状态机
+#+begin_src c :noweb-ref esp8266-fsm
+  void esp8266_do_action(enum ESP8266_ACTION action, void * data) {
+    (void)data;
+    switch (action) {
+    case ESP8266_ATE0_ACTION: esp8266_cmd("ATE0"); break;
+    case ESP8266_AT_ACTION: esp8266_cmd("AT"); break;
+    case ESP8266_AT_PLUS_CIPSTART_ACTION: esp8266_cmd("AT+CIPSTART=\"UDP\",\"" QUOTE(SERVICE_DOMAIN) "\"," QUOTE(SERVICE_PORT)); break;
+    case ESP8266_AT_PLUS_RST_ACTION:
+      esp8266_cmd("AT+RST");
+      initial_timer = systick;
+      rst_retry --;
+      console_log("rst-retry ");
+      console_number(rst_retry);
+      console_newline();
+      break;
+    case ESP8266_AT_PLUS_CIPCLOSE_ACTION: esp8266_cmd("AT+CIPCLOSE"); break;
+    case ESP8266_NETWORK_READ_CALLBACK_ACTION: {
+      console_newline();
+      idle_timer = systick;
+      power_off_timer = systick;
+      is_online = 1;
+      led_on();
+      uint16_t * len = ((uint16_t **) data)[0];
+      uint8_t * buf = ((uint8_t **) data)[1];
+      network_read_callback(buf, * len);
+      break;
+    }
+    case ESP8266_DISABLE_ACTION:
+      console_log("Disabling ESP8266...\r\n");
+      disable_timer = systick;
+      gpio_clear(ESP8266_POWER_PORT, ESP8266_POWER_IO);
+      break;
+    case ESP8266_ENABLE_ACTION:
+      gpio_set(ESP8266_POWER_PORT, ESP8266_POWER_IO);
+      enable_timer = systick;
+      console_log("ESP8266 reenabled\r\n");
+      break;
+    case ESP8266_POWER_OFF_ACTION:
+      console_log("POWER-OFF wifi router\r\n");
+      fan_on();
+      power_off_timer = systick;
+      break;
+    case ESP8266_POWER_ON_ACTION:
+      console_log("POWER-ON wifi router\r\n");
+      fan_off();
+      ring_empty(&esp8266_rx);
+      ring_empty(&esp8266_tx);
+      ring_empty(&esp8266_lengths);
+      stack_clear(&esp8266_stack);
+      initial_timer = systick;
+      break;
+    case ESP8266_STOP_RESET_ACTION:
+      gpio_set(ESP8266_RESET_PORT, ESP8266_RESET_IO);
+      console_log("ESP8266 restared\r\n");
+      console_log("Reset times: ");
+      console_number(network_reset_times);
+      console_newline();
+      network_reset_times ++;
+      ring_empty(&esp8266_rx);
+      ring_empty(&esp8266_tx);
+      ring_empty(&esp8266_lengths);
+      stack_clear(&esp8266_stack);
+      initial_timer = systick;
+      break;
+    case ESP8266_RESET_ACTION:
+      reset_timer = systick;
+      gpio_clear(ESP8266_RESET_PORT, ESP8266_RESET_IO);
+      reset_retry --;
+      console_log("reset-retry ");
+      console_number(reset_retry);
+      console_newline();
+      console_log("Restarting ESP8266...\r\n");
+      break;
+    case ESP8266_ADJUST_SYSTICK_ACTION:
+      console_log("Change systick from ");
+      console_number(systick);
+      console_string(" to ");
+      systick += (network_heart_rate - 1 - ((systick >> 7) & network_heart_rate)) << 7;
+      console_number(systick);
+      console_newline();
+      network_notify_connected();
+      break;
+    case ESP8266_AT_PLUS_CIPSEND_ACTION: {
+      uint8_t size;
+      ring_at(&esp8266_send, 0, &size);
+      char sizestr[10];
+      bzero(sizestr, 10);
+      uint8_t len = uint_to_string(size, sizestr);
+      uint32_t cmdlen = (uint32_t)(11 + len + 2/* CR LF */);
+
+      char buf[cmdlen];
+      bzero(buf, cmdlen);
+      buf[0] = 'A';
+      buf[1] = 'T';
+      buf[2] = '+';
+      buf[3] = 'C';
+      buf[4] = 'I';
+      buf[5] = 'P';
+      buf[6] = 'S';
+      buf[7] = 'E';
+      buf[8] = 'N';
+      buf[9] = 'D';
+      buf[10] = '=';
+      uint8_t ptr = 11;
+
+      for (int i = 0; i < len; i ++) {
+        buf[ptr ++] = sizestr[i];
+      }
+      buf[ptr ++] = '\r';
+      buf[ptr ++] = '\n';
+      if (ring_available(&esp8266_tx) < cmdlen + size/* make sure enough room for at+cipsend and data */) {
+        ring_pop(&esp8266_send, size + 1); // have to drop data and data len
+      } else {
+        ring_write(&esp8266_lengths, cmdlen);
+        ring_write_array(&esp8266_tx, (uint8_t *)buf, 0, cmdlen);
+
+        console_log("[AT+CIPSEND=");
+        console_string(sizestr);
+        console_string("]\r\n");
+      }
+
+      break;
+    }
+    case ESP8266_WRITE_ACTION: {
+      uint8_t size;
+      if (ring_at(&esp8266_send, 0, &size) == 0) {
+        return;
+      }
+      uint8_t buf[size + 2];
+      ring_copy(&esp8266_send, 1, size + 1, buf, size + 2, NULL);
+      ring_pop(&esp8266_send, size + 1);
+      buf[size] = '\r';
+      buf[size + 1] = '\n';
+      ring_write(&esp8266_lengths, size + 2);
+      ring_write_array(&esp8266_tx, buf, 0, size + 2);
+
+      console_log("[");
+      console_output(buf, size);
+      console_string("]\r\n");
+
+      break;
+    }
+    }
+  }
+#+end_src
+*** 语法状态机
+#+begin_src c :noweb-ref esp8266-syntax-fsm
+  void esp8266_syntax_do_action(enum ESP8266_SYNTAX_ACTION action, void * data) {
+    switch (action) {
+    case ESP8266_SYNTAX_OK_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_OK_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_ERROR_ACTION: {
+      switch (esp8266_state) {
+      case ESP8266_AT_ERROR_STATE:
+        if (at_retry == 0) {
+          at_retry = RETRY;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_AND_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          at_retry --;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_EVENT, NULL);
+        }
+        break;
+      case ESP8266_ATE_ERROR_STATE:
+        if (ate_retry == 0) {
+          ate_retry = RETRY;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_AND_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          ate_retry --;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_EVENT, NULL);
+        }
+        break;
+      case ESP8266_CIPSTART_ERROR_STATE:
+        if (cipstart_retry == 0) {
+          cipstart_retry = RETRY;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_AND_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          cipstart_retry --;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_EVENT, NULL);
+        }
+        break;
+      case ESP8266_CIPCLOSE_ERROR_STATE:
+        if (cipclose_retry == 0) {
+          cipclose_retry = RETRY;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_AND_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          cipclose_retry --;
+          esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_EVENT, NULL);
+        }
+        break;
+      default:
+        esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ERROR_EVENT, NULL);
+        break;
+      }
+      break;
+    }
+    case ESP8266_SYNTAX_READY_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_READY_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_WIFI_GOT_IP_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_WIFI_GOT_IP_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_WIFI_DISCONNECT_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_WIFI_DISCONNECT_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_0_CONNECT_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_0_COMMA_CONNECT_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_ALREADY_CONNECT_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_ALREADY_CONNECT_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_CLOSED_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_CLOSED_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_DNS_FAIL_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_DNS_FAIL_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_SEND_OK_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_SEND_OK_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_SEND_FAIL_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_SEND_FAIL_EVENT, NULL);
+      break;
+    case ESP8266_SYNTAX_PUSH_NUMBER_ACTION: {
+      uint32_t * num = (uint32_t * )data;
+      stack_push(&esp8266_stack, (* num) & 0xFF);
+      stack_push(&esp8266_stack, ((* num) >> 8) & 0xFF);
+      break;
+    }
+    case ESP8266_SYNTAX_IPD_LEN_DATA_ACTION: {
+      uint16_t * tlen = ((uint16_t **)data)[1];
+      uint8_t * token = ((uint8_t **)data)[0];
+      uint8_t * dat[2];
+      dat[0] = (uint8_t *) tlen;
+      dat[1] = token;
+      uint8_t cell = 0;
+      uint16_t len = 0;
+      stack_top(&esp8266_stack, &cell);
+      len = (((uint16_t) cell) << 8) & 0xFF00;
+      stack_pop(&esp8266_stack);
+      stack_top(&esp8266_stack, &cell);
+      stack_pop(&esp8266_stack);
+      len |= cell & 0xFF;
+      if (len == *tlen) {
+        esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_PLUS_IPD_COLON_LEN_COMMA_DATA_EVENT, dat);
+      }
+
+      break;
+    }
+    case ESP8266_SYNTAX_GREATER_THAN_ACTION:
+      esp8266_state = esp8266_transform_state(esp8266_state, ESP8266_GREATER_THAN_EVENT, NULL);
+      break;
+    }
+  }
+#+end_src
+*** 词法状态机
+#+begin_src c :noweb-ref esp8266-lex-fsm
+  void at_lex_do_action(enum AT_LEX_ACTION action, void * data) {
+    struct esp8266_parser_ctx_t * ctx = (struct esp8266_parser_ctx_t *) data;
+    switch (action) {
+    case AT_LEX_APPEND_ACTION:
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    case AT_LEX_GREATER_THAN_ACTION:
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_GREATER_THAN_EVENT, NULL);
+      break;
+    case AT_LEX_CR_ACTION:
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_CR_EVENT, NULL);
+      break;
+    case AT_LEX_LF_ACTION:
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_LF_EVENT, NULL);
+      break;
+    case AT_LEX_EOF_ACTION:
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_EOF_EVENT, NULL);
+      break;
+    case AT_LEX_NUMBER_NEWLINE_APPEND_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->token, ctx->ptr);
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_NUMBER_EVENT, &num);
+      esp8266_lex_clear_token(ctx);
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    }
+    case AT_LEX_NUMBER_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_CR_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_LF_ACTION:
+    case AT_LEX_NUMBER_NEWLINE_EOF_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->token, ctx->ptr);
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_NUMBER_EVENT, &num);
+      esp8266_lex_clear_token(ctx);
+      if (action == AT_LEX_NUMBER_NEWLINE_CR_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_CR_EVENT, NULL);
+      } else if (action == AT_LEX_NUMBER_NEWLINE_LF_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_LF_EVENT, NULL);
+      } else if (action == AT_LEX_NUMBER_NEWLINE_EOF_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_EOF_EVENT, NULL);
+      }
+      break;
+    }
+    case AT_LEX_HEX_NEWLINE_APPEND_ACTION:
+      // skip hex
+      esp8266_lex_clear_token(ctx);
+      ctx->token[ctx->ptr++] = ctx->input;
+      break;
+    case AT_LEX_STRING_ACTION:
+    case AT_LEX_STRING_NEWLINE_EOF_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->token;
+      tmp[1] = (uint8_t *) &ctx->ptr;
+      esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_STRING_EVENT, tmp);
+      esp8266_lex_clear_token(ctx);
+      if (action == AT_LEX_STRING_NEWLINE_EOF_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_EOF_EVENT, tmp);
+      }
+      break;
+    }
+    case AT_LEX_TOKEN_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_CR_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_LF_ACTION:
+    case AT_LEX_TOKEN_NEWLINE_EOF_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->token;
+      tmp[1] = (uint16_t *) &ctx->ptr;
+      if (ctx->ptr == 5 &&
+          ctx->token[0] == 'r' &&
+          ctx->token[1] == 'e' &&
+          ctx->token[2] == 'a' &&
+          ctx->token[3] == 'd' &&
+          ctx->token[5] == 'y') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_READY_EVENT, NULL);
+      } else if (ctx->ptr == 2 &&
+                 ctx->token[0] == 'O' &&
+                 ctx->token[1] == 'K') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_OK_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+                 ctx->token[0] == 'E' &&
+                 ctx->token[1] == 'R' &&
+                 ctx->token[2] == 'R' &&
+                 ctx->token[3] == 'O' &&
+                 ctx->token[4] == 'R') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_ERROR_EVENT, NULL);
+      } else if (ctx->ptr == 7 &&
+                 ctx->token[0] == 'C' &&
+                 ctx->token[1] == 'O' &&
+                 ctx->token[2] == 'N' &&
+                 ctx->token[3] == 'N' &&
+                 ctx->token[4] == 'E' &&
+                 ctx->token[5] == 'C' &&
+                 ctx->token[6] == 'T') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_CONNECT_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'W' &&
+                 ctx->token[1] == 'I' &&
+                 ctx->token[2] == 'F' &&
+                 ctx->token[3] == 'I') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_WIFI_EVENT, NULL);
+      } else if (ctx->ptr == 3 &&
+                 ctx->token[0] == 'G' &&
+                 ctx->token[1] == 'O' &&
+                 ctx->token[2] == 'T') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_GOT_EVENT, NULL);
+      } else if (ctx->ptr == 2 &&
+                 (ctx->token[0] == 'I' || ctx->token[0] == 'i') &&
+                 (ctx->token[1] == 'P' || ctx->token[1] == 'p')) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_IP_EVENT, NULL);
+      } else if (ctx->ptr == 10 &&
+                 ctx->token[0] == 'D' &&
+                 ctx->token[1] == 'I' &&
+                 ctx->token[2] == 'S' &&
+                 ctx->token[3] == 'C' &&
+                 ctx->token[4] == 'O' &&
+                 ctx->token[5] == 'N' &&
+                 ctx->token[6] == 'N' &&
+                 ctx->token[7] == 'E' &&
+                 ctx->token[8] == 'C' &&
+                 ctx->token[9] == 'T') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_DISCONNECT_EVENT, NULL);
+      } else if (ctx->ptr == 7 &&
+                 ctx->token[0] == 'A' &&
+                 ctx->token[1] == 'L' &&
+                 ctx->token[2] == 'R' &&
+                 ctx->token[3] == 'E' &&
+                 ctx->token[4] == 'A' &&
+                 ctx->token[5] == 'D' &&
+                 ctx->token[6] == 'Y') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_ALREADY_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+                 ctx->token[0] == 'C' &&
+                 ctx->token[1] == 'L' &&
+                 ctx->token[2] == 'O' &&
+                 ctx->token[3] == 'S' &&
+                 ctx->token[4] == 'E' &&
+                 ctx->token[5] == 'D') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_CLOSED_EVENT, NULL);
+      } else if (ctx->ptr == 3 &&
+                 ctx->token[0] == 'D' &&
+                 ctx->token[1] == 'N' &&
+                 ctx->token[2] == 'S') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_DNS_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'F' &&
+                 ctx->token[1] == 'a' &&
+                 ctx->token[2] == 'i' &&
+                 ctx->token[3] == 'l') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_FAIL_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == 'S' &&
+                 ctx->token[1] == 'E' &&
+                 ctx->token[2] == 'N' &&
+                 ctx->token[3] == 'D') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_SEND_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+                 ctx->token[0] == '+' &&
+                 ctx->token[1] == 'I' &&
+                 ctx->token[2] == 'P' &&
+                 ctx->token[3] == 'D') {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_IPD_EVENT, NULL);
+      } else {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_TOKEN_EVENT, tmp);
+      }
+      esp8266_lex_clear_token(ctx);
+      if (action == AT_LEX_TOKEN_NEWLINE_CR_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_CR_EVENT, NULL);
+      } else if (action == AT_LEX_TOKEN_NEWLINE_LF_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_LF_EVENT, NULL);
+      } else if (action == AT_LEX_TOKEN_NEWLINE_EOF_ACTION) {
+        esp8266_syntax_state = esp8266_syntax_transform_state(esp8266_syntax_state, ESP8266_SYNTAX_EOF_EVENT, NULL);
+      }
+      break;
+    }
+    }
+  }
+#+end_src
+*** 中断响应
+#+begin_src c :noweb-ref esp8266-isr
+    void ESP8266_USART_ISR(void) {
+      uint8_t data = 0;
+      uint32_t result = 0;
+
+      /* Check if we were called because of RXNE. */
+      if (((USART_CR1(ESP8266_USART) & USART_CR1_RXNEIE) != 0) && ((USART_SR(ESP8266_USART) & USART_SR_RXNE) != 0)) {
+
+        /* Retrieve the data from the peripheral. */
+        data = usart_recv(ESP8266_USART);
+        ring_write( &esp8266_rx, data);
+        if (ring_available(&esp8266_rx) == 0) {
+          /* Disable the RXNEIE interrupt */
+          USART_CR1(ESP8266_USART) &= ~USART_CR1_RXNEIE;
+        }
+        console_char(data);
+      }
+
+      /* Check if we were called because of TXE. */
+      if (((USART_CR1(ESP8266_USART) & USART_CR1_TXEIE) != 0) && ((USART_SR(ESP8266_USART) & USART_SR_TXE) != 0)) {
+        if (esp8266_length_to_send == 0) {
+          USART_CR1(ESP8266_USART) &= ~USART_CR1_TXEIE;
+          return;
+        }
+
+        result = ring_read(&esp8266_tx, &data);
+
+        if (result == 0) {
+          /* Disable the TXE interrupt, it's no longer needed. */
+          USART_CR1(ESP8266_USART) &= ~USART_CR1_TXEIE;
+        } else {
+          /* Put data into the transmit register. */
+          usart_send(ESP8266_USART, data);
+          esp8266_length_to_send --;
+        }
+      }
+    }
+#+end_src
+*** 发送数据
+#+begin_src c :noweb-ref esp8266-write
+  void esp8266_write(uint8_t * data, uint32_t size) {
+    if (esp8266_state == ESP8266_CIPSTART_OKAY_STATE) {
+      uint32_t base64_len = base64_encode_length(size);
+      uint8_t base64buf[base64_len];
+      base64_len = base64_encode(data, size, base64buf, base64_len);
+      if (base64_len == 0) return;
+      if (ring_available(&esp8266_send) < base64_len + 1 /* len of len byte */) {
+        console_log("No enough spaces in esp8266_send ringbuffer for ");
+        console_number(base64_len + 1);
+        console_string(" bytes\r\n");
+        return;
+      }
+      ring_write(&esp8266_send, (uint8_t)(base64_len));
+      ring_write_array(&esp8266_send, base64buf, 0, base64_len);
+    }
+  }
+#+end_src
+** 上行接口
+*** 程序框架
+#+begin_src c :tangle /dev/shm/boxos/upstream.h
+  #ifndef _UPSTREAM_H
+  #define _UPSTREAM_H
+
+  #include <stdint.h>
+  #define UPSTREAM_BUFFER_SIZE 128
+
+
+  extern struct ring_t upstream;
+
+  void upstream_setup(void);
+  void upstream_eventloop(void);
+
+  void upstream_send(uint16_t pin, uint8_t * buf, uint8_t size);
+  void upstream_ack(uint16_t pin);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/upstream.c
+  #include "upstream.h"
+  #include "defination.h"
+  #include "network.h"
+  #include "console.h"
+  #include "upstream-fsm.h"
+
+  struct upstream_context {
+    uint32_t state;
+    uint32_t timer;
+    uint16_t pin;
+    uint8_t retry;
+    uint8_t size;
+    uint8_t buffer[UPSTREAM_BUFFER_SIZE];
+  };
+
+  static uint32_t activated = 0;
+  static struct upstream_context ctxs[32];
+
+  static uint32_t loop_timer = 0;
+
+  <<upstream-setup>>
+  <<upstream-mainloop>>
+  <<upstream-send>>
+  <<upstream-ack>>
+  <<upstream-fsm>>
+#+end_src
+*** 配置
+#+begin_src c :noweb-ref upstream-setup
+  void upstream_setup(void) {
+    bzero(ctxs, sizeof(struct upstream_context) * 32);
+  }
+#+end_src
+*** 主循环
+#+begin_src c :noweb-ref upstream-mainloop
+  void upstream_eventloop(void) {
+    if (systick > loop_timer) {
+      loop_timer = systick + 999; // 1 second
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((activated & (1 << i)) == 0) {
+          continue;
+        }
+        if (ctxs[i].state == UPSTREAM_SENDING_STATE) {
+          if (systick > ctxs[i].timer) {
+            if (ctxs[i].retry == 0) {
+              ctxs[i].state = upstream_transform_state(ctxs[i].state, UPSTREAM_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, &i);
+            } else {
+              ctxs[i].state = upstream_transform_state(ctxs[i].state, UPSTREAM_TIMEOUT_NEWLINE_RETRY_GREATER_THAN_0_EVENT, &i);
+            }
+          }
+        }
+      }
+    }
+  }
+#+end_src
+*** 状态机
+#+begin_src c :noweb-ref upstream-fsm
+  void upstream_do_action(enum UPSTREAM_ACTION action, void * data) {
+    uint8_t idx = * (uint8_t *) data;
+    switch (action) {
+    case UPSTREAM_SET_RETRY_NEWLINE_SET_TIMER_NEWLINE_SEND_ACTION:
+      ctxs[idx].retry = 3;
+      ctxs[idx].timer = systick + 2999;
+      network_write(ctxs[idx].buffer, ctxs[idx].size);
+      break;
+    case UPSTREAM_CLEAR_ACTION:
+      activated &= ~(1 << idx);
+      bzero(&ctxs[idx], sizeof(struct upstream_context));
+      break;
+    case UPSTREAM_RETRY_MINUS_1_NEWLINE_SET_TIMER_NEWLINE_SEND_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].timer = systick + 2999;
+      network_write(ctxs[idx].buffer, ctxs[idx].size);
+      break;
+    }
+  }
+#+end_src
+*** 发送数据
+#+begin_src c :noweb-ref upstream-send
+  void upstream_send(uint16_t pin, uint8_t * buf, uint8_t size) {
+    if (size <= UPSTREAM_BUFFER_SIZE) {
+      for (uint8_t i = 0; i < 32; i ++) {
+        if ((activated & (1 << i)) == 0) {
+          ctxs[i].state = UPSTREAM_READY_STATE;
+          ctxs[i].pin = pin;
+          ctxs[i].size = size;
+          for (uint8_t j = 0; j < size; j ++) {
+            ctxs[i].buffer[j] = buf[j];
+          }
+          activated |= (1 << i);
+          ctxs[i].state = upstream_transform_state(ctxs[i].state, UPSTREAM_START_EVENT, &i);
+          break;
+        }
+      }
+    }
+  }
+#+end_src
+*** 响应数据
+#+begin_src c :noweb-ref upstream-ack
+  void upstream_ack(uint16_t pin) {
+    for (uint8_t i = 0; i < 32; i ++) {
+      if ((activated & (1 << i)) == 1) {
+        if (ctxs[i].pin == pin) {
+          activated &= ~(1 << i);
+        }
+      }
+    }
+  }
+#+end_src

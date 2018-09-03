@@ -1,0 +1,7 @@
+#+TITLE: The core application for box based on STM32F103
+#+AUTHOR: Titan
+#+EMAIL: howay.tan@fengchaohuzhu.com
+#+DATE: <2018-09-01 Sat>
+#+KEYWORDS: stm32, cortex m3, box
+#+OPTIONS: H:4 toc:t
+#+STARTUP: indent

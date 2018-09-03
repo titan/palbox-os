@@ -1,0 +1,741 @@
+#+STARTUP: indent
+* 充电系统
+充电系统在总线空闲时，会定时查询充电器的状态，如果和缓存中的状态不一致，
+就把充电状态上报到服务器。
+** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/charger.h
+  #ifndef _CHARGER_H
+  #define _CHARGER_H
+  #include <stdint.h>
+  #include "ring.h"
+
+  #define MAX_CHARGER_BIT 2
+  #define MAX_CHARGERS (2 << (MAX_CHARGER_BIT - 1))
+
+  void charger_setup(struct ring_t * tx, struct ring_t * rx);
+  void charger_start(void);
+  void charger_boot_scan(void);
+  void charger_eventloop(void);
+  void charger_callback(uint8_t * buf, uint32_t size);
+  void charger_status(uint8_t charger, uint16_t pin);
+  void charger_config(uint8_t charger, uint16_t pin);
+  void charger_config_exclamation_marks(uint8_t charger, uint8_t enable_charging, uint8_t enable_heating, uint16_t pin);
+  void charger_scan(uint8_t charger);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/charger.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "defination.h"
+  #include "charger.h"
+  #include "packet.h"
+  #include "network.h"
+  #include "console.h"
+  #include "utility.h"
+  #include "charger-packet.h"
+  #include "uart.h"
+  #include "ring.h"
+  #include "charger-fsm.h"
+
+  struct charger_context {
+    uint32_t state;
+    uint32_t cmd_timer;
+    uint32_t cmd_interval;
+    uint32_t scan_timer;
+    uint32_t scan_interval;
+    uint32_t sync_timer;
+    uint32_t sync_interval;
+    uint32_t retry;
+    uint16_t pin;
+    uint8_t batteries_len;
+    uint8_t enable_charging;
+    uint8_t enable_heating;
+  };
+
+  static struct charger_context ctxs[MAX_CHARGERS];
+
+  static struct ring_t * charger_tx;
+  static struct ring_t * charger_rx;
+
+  static uint32_t loop_timer;
+  static uint8_t activated;
+  static uint8_t plugged[MAX_CHARGERS];
+  static uint8_t charging[MAX_CHARGERS];
+  static uint8_t full[MAX_CHARGERS];
+  static uint8_t heating[MAX_CHARGERS];
+  static uint8_t temperature[MAX_CHARGERS];
+  static uint8_t errno[MAX_CHARGERS];
+  static uint8_t batteries[MAX_CHARGERS][4];
+
+  <<setup>>
+  void charger_start() {
+  }
+
+  void charger_boot_scan(void) {
+    for (uint8_t i = 0; i < MAX_CHARGERS; i ++) {
+      ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_ONLINE_COMMA_TX_FREE_EVENT, &i);
+    }
+  }
+
+  <<mainloop>>
+  <<callback>>
+  <<query-charger-status>>
+  <<query-charger-config>>
+  <<config-charger>>
+  <<fsm>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  void charger_setup(struct ring_t * tx, struct ring_t * rx) {
+    charger_tx = tx;
+    charger_rx = rx;
+    loop_timer = 0;
+    activated = 0;
+
+    for (uint8_t i = 0; i < MAX_CHARGERS; i ++) {
+      bzero(&ctxs[i], sizeof(struct charger_context));
+      ctxs[i].state = CHARGER_READY_STATE;
+      ctxs[i].cmd_timer = systick;
+      ctxs[i].cmd_interval = 499; // 500 ms
+      ctxs[i].sync_timer = systick;
+      ctxs[i].sync_interval = 10 * 60 * 1000 - 1; // 10 minutes to timeout
+      ctxs[i].scan_timer = systick;
+      ctxs[i].scan_interval = 5 * 1000 - 1; // 5 seconds
+    }
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref mainloop
+  void charger_eventloop() {
+    if (systick > loop_timer) {
+      loop_timer = systick + 2999; // interval of 3 seconds
+
+      if (network_is_online() && ring_length(charger_tx) == 0) {
+        for (uint8_t i = 0; i < MAX_CHARGERS; i ++) {
+          if ((activated & (1 << i)) == 0) continue;
+          if (ctxs[i].state == CHARGER_READY_STATE || ctxs[i].state == CHARGER_SCANNING_STATE) {
+            if (systick > ctxs[i].scan_timer) {
+              ctxs[i].scan_timer = systick + ctxs[i].scan_interval;
+              ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_ONLINE_COMMA_TX_FREE_COMMA_SCAN_TIMER_EVENT, &i);
+            } else {
+              ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_ONLINE_COMMA_TX_FREE_EVENT, &i);
+            }
+          }
+        }
+      }
+      for (uint8_t i = 0; i < MAX_CHARGERS; i ++) {
+        if ((activated & (1 << i)) == 0) continue;
+        if (ctxs[i].state == CHARGER_QUERYING_STATUS_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        } else if (ctxs[i].state == CHARGER_QUERYING_CONFIG_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        } else if (ctxs[i].state == CHARGER_CONFIGING_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        } else if (ctxs[i].state == CHARGER_SCANNING_STATE) {
+          if (systick > ctxs[i].sync_timer) {
+            ctxs[i].sync_timer = systick + ctxs[i].sync_interval;
+            ctxs[i].state = charger_transform_state(ctxs[i].state, CHARGER_SYNC_TIMEOUT_EVENT, &i);
+          }
+        }
+      }
+    }
+  }
+#+end_src
+** 协议回调
+#+begin_src c :noweb-ref callback
+  void charger_callback(uint8_t * buf, uint32_t size) {
+    uint32_t len = charger_packet_estimate_decode_size(buf, size);
+    uint8_t tmp[len];
+    bzero(tmp, len);
+    struct charger_packet_t * packet = (struct charger_packet_t *) &tmp;
+    switch (charger_packet_decode(buf, size, packet)) {
+    case CHARGER_QUERY_STATUS_RESPONSE: {
+      uint8_t idx = packet->charger - 1;
+      activated |= 1 << idx;
+      if ((packet->payload.sn != 0) ||
+          ((plugged[idx] ^ packet->payload.plugged) +
+           (charging[idx] ^ packet->payload.charging) +
+           (full[idx] ^ packet->payload.full) +
+           (heating[idx] ^ packet->payload.heating) +
+           (temperature[idx] ^ packet->payload.temperature) +
+           (errno[idx] ^ packet->payload.errno) +
+           (batteries[idx][0] ^ packet->payload.batteries[0]) +
+           (batteries[idx][1] ^ packet->payload.batteries[1]) +
+           (batteries[idx][2] ^ packet->payload.batteries[2]) +
+           (batteries[idx][3] ^ packet->payload.batteries[3])) != 0) {
+        ctxs[idx].pin = packet->payload.sn;
+        ctxs[idx].batteries_len = 4;
+        plugged[idx] = packet->payload.plugged;
+        charging[idx] = packet->payload.charging;
+        full[idx] = packet->payload.full;
+        heating[idx] = packet->payload.heating;
+        temperature[idx] = packet->payload.temperature;
+        errno[idx] = packet->payload.errno;
+        batteries[idx][0] = packet->payload.batteries[0];
+        batteries[idx][1] = packet->payload.batteries[1];
+        batteries[idx][2] = packet->payload.batteries[2];
+        batteries[idx][3] = packet->payload.batteries[3];
+        ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_QUERY_STATUS_ACK_COMMA_CHANGED_EVENT, &idx);
+      } else {
+        ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_QUERY_STATUS_ACK_COMMA_NOT_CHANGED_EVENT, &idx);
+      }
+      break;
+    }
+    case CHARGER_QUERY_CONFIG_RESPONSE: {
+      uint8_t idx = packet->charger - 1;
+      activated |= 1 << idx;
+      ctxs[idx].pin = packet->payload.sn;
+      ctxs[idx].enable_charging = packet->payload.enable_charging;
+      ctxs[idx].enable_heating = packet->payload.enable_heating;
+      ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_QUERY_CONFIG_ACK_EVENT, &idx);
+      break;
+    }
+    case CHARGER_CONFIG_RESPONSE: {
+      uint8_t idx = packet->charger - 1;
+      activated |= 1 << idx;
+      ctxs[idx].pin = packet->payload.sn;
+      ctxs[idx].enable_charging = packet->payload.enable_charging;
+      ctxs[idx].enable_heating = packet->payload.enable_heating;
+      ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_CONFIG_ACK_EVENT, &idx);
+      break;
+    }
+    case CHARGER_FIREWARE_RESPONSE: {
+      console_log("Upgrading charger fireware is not implemented\r\n");
+      break;
+    }
+    default:
+      console_log("Unknown command ");
+      console_number(packet->payload.cmd);
+      console_string(" from charger ");
+      console_number(packet->charger);
+      console_newline();
+      break;
+    }
+  }
+#+end_src
+** 状态机
+#+begin_src c :noweb-ref fsm
+  void charger_do_action(enum CHARGER_ACTION action, void * data) {
+    uint8_t idx = * (uint8_t *) data;
+    switch (action) {
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_STATUS_ACTION:
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_PIN_EQUALS_0_NEWLINE_QUERY_STATUS_ACTION:
+      ctxs[idx].retry = 2;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      if (action == CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_PIN_EQUALS_0_NEWLINE_QUERY_STATUS_ACTION) {
+        ctxs[idx].pin = 0;
+      }
+      query_status(idx + 1, ctxs[idx].pin);
+      break;
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_CONFIG_ACTION:
+      ctxs[idx].retry = 2;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      query_config(idx + 1, ctxs[idx].pin);
+      break;
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_CONFIG_ACTION:
+      ctxs[idx].retry = 2;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      config(idx + 1, ctxs[idx].enable_charging, ctxs[idx].enable_heating, ctxs[idx].pin);
+      break;
+    case CHARGER_SET_ACTIVATED_NEWLINE_RESET_RETRY_NEWLINE_ACK_QUERY_STATUS_ACTION:
+    case CHARGER_ACK_QUERY_STATUS_ACTION: {
+      if (action == CHARGER_SET_ACTIVATED_NEWLINE_RESET_RETRY_NEWLINE_ACK_QUERY_STATUS_ACTION) {
+        activated |= (1 << idx);
+        ctxs[idx].retry = 2;
+      }
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = CHARGER_STATUS;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.charger_plugged = plugged[idx];
+      confirm.charger_charging = charging[idx];
+      confirm.charger_full = full[idx];
+      confirm.charger_heating = heating[idx];
+      confirm.batteries = batteries[idx];
+      confirm.__batteries_len = ctxs[idx].batteries_len;
+      confirm.temperature = temperature[idx];
+      confirm.errno = errno[idx];
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm CHARGER-STATUS (");
+      console_number(idx + 1);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+
+      break;
+    }
+    case CHARGER_SET_ACTIVATED_NEWLINE_RESET_RETRY_ACTION:
+      activated |= 1 << idx;
+      ctxs[idx].retry = 2;
+      break;
+    case CHARGER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_STATUS_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      query_status(idx + 1, ctxs[idx].pin);
+      break;
+    case CHARGER_ACK_QUERY_CONFIG_ACTION: {
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = CHARGER_CONFIG;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.enable_charging = ctxs[idx].enable_charging;
+      confirm.enable_heating = ctxs[idx].enable_heating;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm CHARGER-CONFIG (");
+      console_number(idx + 1);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+      break;
+    }
+    case CHARGER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_CONFIG_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      query_config(idx + 1, ctxs[idx].pin);
+      break;
+    case CHARGER_ACK_CONFIG_ACTION: {
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = CONFIG_CHARGER;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.enable_charging = ctxs[idx].enable_charging;
+      confirm.enable_heating = ctxs[idx].enable_heating;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm CONFIG-CHARGER (");
+      console_number(idx + 1);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+
+      break;
+    }
+    case CHARGER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_CONFIG_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      config(idx + 1, ctxs[idx].enable_charging, ctxs[idx].enable_heating, ctxs[idx].pin);
+      break;
+    case CHARGER_CLEAR_CACHE_ACTION:
+      plugged[idx] = 0;
+      charging[idx] = 0;
+      full[idx] = 0;
+      heating[idx] = 0;
+      temperature[idx] = 0;
+      errno[idx] = 0;
+      batteries[idx][0] = 0;
+      batteries[idx][1] = 0;
+      batteries[idx][2] = 0;
+      batteries[idx][3] = 0;
+      break;
+    }
+  }
+#+end_src
+** 查询充电器状态
+#+begin_src c :noweb-ref query-charger-status
+  static void query_status(uint8_t charger, uint16_t pin) {
+    struct charger_packet_t packet;
+    bzero(&packet, sizeof(struct charger_packet_t));
+    packet.charger = charger;
+    packet.version = 0;
+    packet.payload.sn = pin;
+    packet.payload.cmd = CHARGER_QUERY_STATUS_REQUEST;
+    packet.payload.timestamp = timestamp;
+    packet.payload.fireware_version = 0;
+    populate_charger_packet_to_tx(&packet, charger_tx);
+  }
+
+  void charger_status(uint8_t charger, uint16_t pin) {
+    uint8_t idx = charger - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_QUERY_STATUS_EVENT, &idx);
+  }
+#+end_src
+** 查询充电器配置
+#+begin_src c :noweb-ref query-charger-config
+  static void query_config(uint8_t charger, uint16_t pin) {
+    struct charger_packet_t packet;
+    bzero(&packet, sizeof(struct charger_packet_t));
+    packet.charger = charger;
+    packet.version = 0;
+    packet.payload.sn = pin;
+    packet.payload.cmd = CHARGER_QUERY_CONFIG_REQUEST;
+    packet.payload.timestamp = timestamp;
+    packet.payload.fireware_version = 0;
+    populate_charger_packet_to_tx(&packet, charger_tx);
+  }
+
+  void charger_config(uint8_t charger, uint16_t pin) {
+    uint8_t idx = charger - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_QUERY_CONFIG_EVENT, &idx);
+  }
+#+end_src
+** 配置充电器
+#+begin_src c :noweb-ref config-charger
+  static void config(uint8_t charger, uint8_t enable_charging, uint8_t enable_heating, uint16_t pin) {
+    struct charger_packet_t packet;
+    bzero(&packet, sizeof(struct charger_packet_t));
+    packet.charger = charger;
+    packet.version = 0;
+    packet.payload.sn = pin;
+    packet.payload.cmd = CHARGER_CONFIG_REQUEST;
+    packet.payload.timestamp = timestamp;
+    packet.payload.fireware_version = 0;
+    packet.payload.enable_charging = enable_charging;
+    packet.payload.enable_heating = enable_heating;
+    populate_charger_packet_to_tx(&packet, charger_tx);
+  }
+
+  void charger_config_exclamation_marks(uint8_t charger, uint8_t enable_charging, uint8_t enable_heating, uint16_t pin) {
+    uint8_t idx = charger - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].enable_charging = enable_charging;
+    ctxs[idx].enable_heating = enable_heating;
+    ctxs[idx].state = charger_transform_state(ctxs[idx].state, CHARGER_CONFIG_EVENT, &idx);
+  }
+#+end_src
+** 通讯协议
+*** 命令编号
+| 编号 | 名称                  | 说明         |
+|------+-----------------------+--------------|
+|    1 | query-status-request  | 查询状态     |
+|    2 | query-statue-response | 查询状态响应 |
+|    3 | query-config-request  | 查询配置     |
+|    4 | query-config-response | 查询配置响应 |
+|    5 | config-request        | 配置         |
+|    6 | config-response       | 配置响应     |
+|    7 | fireware-request      | 固件数据     |
+|    8 | rireware-response     | 固件数据响应 |
+
+*** 命令参数矩阵
+
+| 命令         | 时间戳 | 固件版本 | 插上标志 | 充电中标志 | 充满标志 | 加热中标志 | 电量数组 | 温度 | 故障编码 | 充电启用 | 加热启用 | 片段编号 | 片段大小 | 片段校验 | 片段内容 |
+|--------------+--------+----------+----------+------------+----------+------------+----------+------+----------+----------+----------+----------+----------+----------+----------|
+| 查询状态     | ✓      |          |          |            |          |            |          |      |          |          |          |          |          |          |          |
+| 查询状态响应 |        | ✓        | ✓        | ✓          | ✓        | ✓          | ✓        | ✓    | ✓        |          |          |          |          |          |          |
+| 查询配置     | ✓      |          |          |            |          |            |          |      |          |          |          |          |          |          |          |
+| 查询配置响应 |        | ✓        |          |            |          |            |          |      |          | ✓        | ✓        |          |          |          |          |
+| 配置         | ✓      |          |          |            |          |            |          |      |          | ✓        | ✓        |          |          |          |          |
+| 配置响应     |        | ✓        |          |            |          |            |          |      |          | ✓        | ✓        |          |          |          |          |
+| 固件数据     | ✓      | ✓        |          |            |          |            |          |      |          |          |          | ✓        | ✓        | ✓        | [✓]      |
+| 固件数据响应 |        | ✓        |          |            |          |            |          |      |          |          |          | ✓        | ✓        | ✓        |          |
+
+注意：
+
+1. 插上标志，充电中标志，充满标志，加热中标志，充电启用，加热启用这些
+   参数均采用二进制设计，真为 1，假为 0。按充电通道编号，从低到高依次
+   排列在一个字节中。通道 0 在最低位。
+
+2. 当片段编号为 0 时，片段大小存放的是整个升级包的大小，片段检验存放的
+   是整个升级包的检验值，片段内容此时为空。固件版本号是升级包的版本号。
+
+*** 参数结构
+
+#+begin_src lisp :tangle /dev/shm/boxos/charger.tr
+  (struct charger-payload
+    (int 0 sn) ;; 请求序列号
+    (byte 1 cmd) ;; 命令编号
+    (long 2 timestamp) ;; 时间戳
+    (byte 3 fireware-version) ;; 固件版本号
+    (byte 4 plugged) ;; 插入标志
+    (byte 5 charging) ;; 充电中标志
+    (byte 6 full) ;; 充满标志
+    (byte 7 heating) ;; 加热中标志
+    (byte* 8 batteries) ;; 电量
+    (short 9 temperature) ;; 温度
+    (long 10 errno) ;; 故障编码
+    (byte 11 enable-charging) ;; 充电启用
+    (byte 12 enable-heating) ;; 加热启用
+    (short 13 slice-no) ;; 片段编号
+    (short 14 slice-size) ;; 片段大小
+    (int 15 slice-checksum) ;; 片段校验
+    (byte* 16 slice) ;; 片段内容
+    )
+#+end_src
+*** 协议封包
+#+begin_src c :tangle /dev/shm/boxos/charger-packet.h
+  #ifndef _CHARGER_PACKET_H
+  #define _CHARGER_PACKET_H
+  #include <stdint.h>
+  #include "charger_payload.h"
+  typedef enum CHARGER_CMD_TYPE {
+    CHARGER_UNKNOWN = 0x00,
+    CHARGER_QUERY_STATUS_REQUEST = 0x01,
+    CHARGER_QUERY_STATUS_RESPONSE = 0x02,
+    CHARGER_QUERY_CONFIG_REQUEST = 0x03,
+    CHARGER_QUERY_CONFIG_RESPONSE = 0x04,
+    CHARGER_CONFIG_REQUEST = 0x05,
+    CHARGER_CONFIG_RESPONSE = 0x06,
+    CHARGER_FIREWARE_REQUEST = 0x07,
+    CHARGER_FIREWARE_RESPONSE = 0x08,
+  } charger_cmd_type_t;
+
+
+  struct charger_packet_t {
+    uint8_t charger;
+    uint8_t version;
+    charger_payload_t payload;
+  };
+
+  #define _populate_charger_packet_to_tx_1(packet, tx, line) do {         \
+      uint32_t elen##line = charger_packet_calculate_encode_size(packet); \
+      uint8_t ebuf##line[elen##line];                                     \
+      uint8_t size_of_len##line = 0;                                      \
+      if (elen##line < 128) {                                             \
+        size_of_len##line = 1;                                            \
+      } else if (elen##line < 16384) {                                    \
+        size_of_len##line = 2;                                            \
+      } else if (elen##line < 2097152) {                                  \
+        size_of_len##line = 3;                                            \
+      } else {                                                            \
+        size_of_len##line = 4;                                            \
+      }                                                                   \
+      if (ring_available(tx) >= elen##line + size_of_len##line) {         \
+        bzero(ebuf##line, elen##line);                                    \
+        uint32_t len##line = charger_packet_encode(packet, ebuf##line, elen##line); \
+        elen##line = len##line;                                           \
+        while (elen##line > 0) {                                          \
+          ring_write(tx, elen##line & 0x7F);                              \
+          elen##line = elen##line >> 7;                                   \
+        }                                                                 \
+        ring_write_array(tx, ebuf##line, 0, len##line);                   \
+      }                                                                   \
+    } while (0)
+
+  #define _populate_charger_packet_to_tx_0(packet, tx, line) _populate_charger_packet_to_tx_1(packet, tx, line)
+
+  #define populate_charger_packet_to_tx(packet, tx) _populate_charger_packet_to_tx_0(packet, tx, __LINE__)
+
+  uint32_t charger_packet_calculate_encode_size(struct charger_packet_t * payload);
+  uint32_t charger_packet_encode(struct charger_packet_t * payload, uint8_t * buf, uint32_t size);
+  uint32_t charger_packet_estimate_decode_size(uint8_t * buf, uint32_t size);
+  charger_cmd_type_t charger_packet_decode(uint8_t * buf, uint32_t size, struct charger_packet_t * packet);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/charger-packet.c
+  #include "charger-packet.h"
+  #include "hash.h"
+  #include "base64.h"
+
+  /*
+    packet layout:
+
+            +-+-+-+-+-+-+-+-+
+    byte 0  |1|1|0|0|1|1|0|0|   magic number 0
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |0|0|1|1|1|1|0|0|   magic number 1
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |1|1|0|0|0|0|1|1|   magic number 2
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 3  |0|0|1|1|0|0|1|1|   magic number 3
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 4  |x|x|x|x|x|x|x|x|   adle32-0 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 5  |x|x|x|x|x|x|x|x|   adle32-1 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 6  |x|x|x|x|x|x|x|x|   adle32-2 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 7  |x|x|x|x|x|x|x|x|   adle32-3 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 8  |0|0|0|0|0|x|x|x|   chareger no
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 9  |0|0|0|0|0|0|0|0|   version
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte A  |x|x|x|x|x|x|x|x|   length0 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte B  |x|x|x|x|x|x|x|x|   length1 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte C  |x|x|x|x|x|x|x|x|   begin of data (base64)
+            +-+-+-+-+-+-+-+-+
+                    .
+                    .
+                    .
+            +-+-+-+-+-+-+-+-+
+    byte n  |x|x|x|x|x|x|x|x|   end of data (base64)
+            +-+-+-+-+-+-+-+-+
+
+  ,*/
+
+  #define CHARGER_PACKET_META_SIZE (4 + 4 + 1 + 1 + 2) // except data
+
+  uint32_t charger_packet_calculate_encode_size(struct charger_packet_t * packet) {
+    return base64_encode_length(charger_payload_calculate_size(&packet->payload)) + CHARGER_PACKET_META_SIZE;
+  }
+
+  uint32_t charger_packet_encode(struct charger_packet_t * packet, uint8_t * buf, uint32_t size) {
+    uint32_t payload_size = charger_payload_calculate_size(&packet->payload);
+    uint8_t zbuf[payload_size];
+    int zsize = charger_payload_encode_zeropack(&packet->payload, zbuf, payload_size);
+
+    uint32_t base64_len = base64_encode(zbuf, zsize, buf + CHARGER_PACKET_META_SIZE, size - CHARGER_PACKET_META_SIZE);
+    if (base64_len == 0) return 0;
+    buf[0] = 0xCC;
+    buf[1] = 0xC3;
+    buf[2] = 0x3C;
+    buf[3] = 0x33;
+    buf[8] = packet->charger;
+    buf[9] = packet->version;
+    buf[10] = base64_len & 0xFF;
+    buf[11] = (base64_len >> 8) & 0xFF;
+    uint32_t checksum = adler32(buf + 8, base64_len + 4 /* charger + version + data length */);
+    buf[4] = checksum & 0xFF;
+    buf[5] = (checksum >> 8) & 0xFF;
+    buf[6] = (checksum >> 16) & 0xFF;
+    buf[7] = (checksum >> 24) & 0xFF;
+    return CHARGER_PACKET_META_SIZE + base64_len;
+  }
+
+  uint32_t charger_packet_estimate_decode_size(uint8_t * buf, uint32_t size) {
+    if (size <= CHARGER_PACKET_META_SIZE) return 0;
+    if (buf[0] != 0xCC ||
+        buf[1] != 0xC3 ||
+        buf[2] != 0x3C ||
+        buf[3] != 0x33) {
+      return 0;
+    }
+    uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
+    uint32_t checksum = adler32(buf + 8, len + 4);
+    if ((buf[4] == (checksum & 0xFF)) &&
+        (buf[5] == ((checksum >> 8) & 0xFF)) &&
+        (buf[6] == ((checksum >> 16) & 0xFF)) &&
+        (buf[7] == ((checksum >> 24) & 0xFF))) {
+      uint32_t zlen = base64_decode_length(buf + CHARGER_PACKET_META_SIZE, len);
+      if (zlen == 0) return 0;
+      uint8_t zbuf[zlen];
+      base64_decode(buf + CHARGER_PACKET_META_SIZE, len, zbuf, zlen);
+      return charger_payload_estimate_zeropack_size(zbuf, zlen) + CHARGER_PACKET_META_SIZE;
+    }
+    return 0;
+  }
+
+  charger_cmd_type_t charger_packet_decode(uint8_t * buf, uint32_t size, struct charger_packet_t * packet) {
+    if (size < CHARGER_PACKET_META_SIZE) return 0;
+    if (buf[0] != 0xCC ||
+        buf[1] != 0xC3 ||
+        buf[2] != 0x3C ||
+        buf[3] != 0x33) {
+      return 0;
+    }
+    uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
+    uint32_t checksum = adler32(buf + 8, len + 4);
+    if ((buf[4] == (checksum & 0xFF)) &&
+        (buf[5] == ((checksum >> 8) & 0xFF)) &&
+        (buf[6] == ((checksum >> 16) & 0xFF)) &&
+        (buf[7] == ((checksum >> 24) & 0xFF))) {
+      uint32_t zlen = base64_decode_length(buf + CHARGER_PACKET_META_SIZE - 1, len);
+      if (zlen == 0) return 0;
+      uint8_t zbuf[zlen];
+      zlen = base64_decode(buf + CHARGER_PACKET_META_SIZE, len, zbuf, zlen);
+      uint32_t dlen = charger_payload_estimate_zeropack_size(zbuf, zlen);
+      uint8_t dbuf[dlen];
+      charger_payload_decode_zeropack(zbuf, zlen, dbuf, &packet->payload);
+      packet->version = buf[9];
+      packet->charger = buf[8];
+      return packet->payload.cmd;
+    }
+    return 0;
+  }
+
+  #if 0
+  #include <stdio.h>
+  #include <string.h>
+
+  int main() {
+    struct charger_packet_t packet;
+    memset(&packet, 0, sizeof(struct charger_packet_t));
+    packet.charger = 1;
+    packet.version = 1;
+    packet.payload.sn = 0;
+    packet.payload.cmd = 1;
+    packet.payload.timestamp = 15000000;
+    packet.payload.fireware_version = 10;
+    uint8_t batteries[4] = {1,2,3,4};
+    charger_payload_set_batteries(&packet.payload, batteries, 4);
+    uint32_t elen = charger_packet_calculate_encode_size(&packet);
+    uint8_t ebuf[elen];
+    memset(ebuf, 0, elen);
+    charger_packet_encode(&packet, ebuf, elen);
+
+    uint8_t dlen = charger_packet_estimate_decode_size(ebuf, elen);
+    uint8_t dbuf[dlen];
+    memset(dbuf, 0, dlen);
+    struct charger_packet_t * decoded = (struct charger_packet_t *) dbuf;
+    printf("result: %d\n", charger_packet_decode(ebuf, elen, decoded));
+
+    printf("charger: %d\n", decoded->charger);
+    printf("version: %d\n", decoded->version);
+    printf("sn: %d\n", decoded->payload.sn);
+    printf("cmd: %d\n", decoded->payload.cmd);
+    printf("timestamp: %d\n", decoded->payload.timestamp);
+    printf("fireware_version: %d\n", decoded->payload.fireware_version);
+    printf("batteries len: %d\n", decoded->payload.__batteries_len);
+    for (int i = 0; i < decoded->payload.__batteries_len; i ++) {
+      printf("batteries[%d]: %d\n", i, decoded->payload.batteries[i]);
+    }
+
+    return 0;
+  }
+  #endif
+#+end_src

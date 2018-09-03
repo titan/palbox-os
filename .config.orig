@@ -1,0 +1,9 @@
+LIBOPENCM3=/home/titan/Works/pal/m3/libopencm3
+LOCK=FC
+NETWORK=EC20
+DOMAIN=palbox.fengchaohuzhu.com
+PORT=5008
+#DEBUG=1
+#ENGINEER_MODE=1
+MAIN_VERSION=1
+SUB_VERSION=0

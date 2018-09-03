@@ -1,0 +1,948 @@
+#+STARTUP: indent
+* 读卡器
+** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/card-reader.h
+  #ifndef _CARD_READER_H
+  #define _CARD_READER_H
+  #include <stdint.h>
+  #include "ring.h"
+  #include "card_payload.h"
+
+  void card_reader_setup(struct ring_t * tx, struct ring_t * rx);
+  void card_reader_eventloop(void);
+  void card_reader_callback(card_payload_t * payload);
+  void card_reader_play(uint8_t card_reader, uint16_t audio);
+  void card_reader_confirm_play(uint8_t card_reader, uint16_t audio, int16_t pin);
+  void card_reader_volume(uint8_t card_reader, uint8_t volume);
+  void card_reader_confirm_volume(uint8_t card_reader, uint8_t volume, int16_t pin);
+  void card_reader_block(uint8_t card_reader);
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/card-reader.c
+  #include <stddef.h>
+  #include "card-reader.h"
+  #include "defination.h"
+  #include "ring.h"
+  #include "uart3-packet.h"
+  #include "utility.h"
+  #include "network.h"
+  #include "console.h"
+  #include "packet.h"
+  #include "upstream.h"
+  #include "lock.h"
+  #include "mt19937.h"
+
+  typedef enum CARD_READER_CMD_TYPE {
+    CARD_READER_UNKNOWN = 0x00,
+    CARD_READER_ERROR = 0x01,
+    CARD_READER_PING = 0x02,
+    CARD_READER_ONLINE = 0x03,
+    CARD_READER_OFFLINE = 0x04,
+    CARD_READER_CARD_LOCK_OFF = 0x05,
+    CARD_READER_PLAY = 0x06,
+    CARD_READER_VOLUME_UP = 0x07,
+    CARD_READER_VOLUME_DOWN = 0x08,
+    CARD_READER_TOKEN_LOCK_OFF = 0x09,
+    CARD_READER_BLOCK = 0x0A,
+    CARD_READER_VOLUME = 0x0B,
+  } card_cmd_type_t;
+
+  #define CARD_READER_TOKENS_BUFFER_BITSIZE 4
+
+  static struct ring_t * card_reader_tx;
+
+  static struct ring_t * card_reader_rx;
+
+  static struct ring_t card_reader_tokens;
+  uint8_t card_reader_tokens_buffer[2 << (CARD_READER_TOKENS_BUFFER_BITSIZE - 1)];
+
+  <<setup>>
+  <<callback>>
+  void card_reader_eventloop(void) {
+  }
+  <<play>>
+  <<volume>>
+  <<block>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  void card_reader_setup(struct ring_t * tx, struct ring_t * rx) {
+    card_reader_tx = tx;
+    card_reader_rx = rx;
+
+    ring_init(&card_reader_tokens, card_reader_tokens_buffer, CARD_READER_TOKENS_BUFFER_BITSIZE);
+  }
+#+end_src
+** 协议回调
+#+begin_src c :noweb-ref callback
+  void card_reader_callback(card_payload_t * payload) {
+    switch (payload->cmd) {
+    case CARD_READER_CARD_LOCK_OFF: {
+      console_log("Card-reader CARD-LOCK-OFF, reader: ");
+      console_number(payload->reader_id);
+      console_string(", card_no: ");
+      console_number(payload->card);
+      console_string(", door: ");
+      console_number(payload->door);
+      console_newline();
+      parameter_t param;
+      bzero(&param, sizeof(parameter_t));
+      param.sn = sn ++;
+      param.card_no = payload->card;
+      param.lock = payload->door;
+      param.door = payload->long_door;
+      param.card_reader = payload->reader_id;
+      param.pin = ((payload->reader_id << 12) | timestamp) & 0xFFFF;
+      param.timestamp = timestamp;
+      param.rssi = network_rssi;
+      param.ber = network_ber;
+      param.reply_time = network_reply_time;
+      param.ttl = network_ttl;
+      param.network_reset = (int) network_reset_times;
+      param.network_shutdown = (int) network_shutdown_times;
+
+      uint8_t param_size = packet_calculate_encode_size(&param);
+      uint8_t upbuf[param_size];
+      uint8_t bufsize = packet_encode(LOCK_OFF, uid, &param, upbuf, param_size);
+      upstream_send(param.pin, upbuf, bufsize);
+
+      break;
+    }
+    case CARD_READER_TOKEN_LOCK_OFF:
+      console_log("Card-reader TOKEN-LOCK-OFF, reader: ");
+      console_number(payload->reader_id);
+      console_string(", token: ");
+      console_number(payload->token);
+      console_newline();
+      if (timestamp > MIN_TIMESTAMP) {
+        int64_t ts = timestamp;
+        randkey[3] = ts / 60000;
+        console_log("Randkey: ");
+        console_number(randkey[0]);
+        console_string(", ");
+        console_number(randkey[1]);
+        console_string(", ");
+        console_number(randkey[2]);
+        console_string(", ");
+        console_number(randkey[3]);
+        console_newline();
+        mt19937_init_by_array(randkey, 4);
+        for (uint8_t bi = 1; bi < MAX_LOCK_BOARDS + 1; bi ++) {
+          for (uint8_t lj = 1; lj < MAX_LOCKS + 1; lj ++) {
+            uint32_t token = mt19937_uint32() % 1000000;
+            if (token == (uint32_t)payload->token) {
+              console_log("TOKEN-LOCK-OFF board: ");
+              console_number(bi);
+              console_string(", lock: ");
+              console_number(lj);
+              console_newline();
+              if (ring_find(&card_reader_tokens, (uint8_t *)&token, 4, NULL) == -1) {
+                lock_off(bi - 1, lj - 1, lock_generate_pin(bi, lj, timestamp));
+                if (ring_available(&card_reader_tokens) < 4) {
+                  ring_pop(&card_reader_tokens, 4);
+                }
+                ring_write_array(&card_reader_tokens, (uint8_t *)&token, 0, 4);
+                card_reader_play(payload->reader_id, 19);
+                return;
+              } else {
+                console_log("Found dup token\r\n");
+                goto token_is_invalid;
+              }
+            }
+          }
+        }
+        for (uint8_t bi = 1; bi < MAX_LOCK_BOARDS + 1; bi ++) {
+          for (uint8_t lj = 1; lj < MAX_LOCKS; lj ++) {
+            uint32_t token = mt19937_uint32() % 1000000;
+            if (token == (uint32_t)payload->token) {
+              console_log("TOKEN-LOCKS-OFF board: ");
+              console_number(bi);
+              console_string(", locks: ");
+              console_number(lj);
+              console_string(", ");
+              console_number(lj + 1);
+              console_newline();
+              if (ring_find(&card_reader_tokens, (uint8_t *)&token, 4, NULL) == -1) {
+                uint8_t locks[2] = {lj - 1, lj};
+                uint16_t pins[2] = {lock_generate_pin(bi - 1, lj - 1, timestamp), lock_generate_pin(bi - 1, lj, timestamp)};
+                lock_multi_off(bi - 1, locks, 2, pins, 2);
+                if (ring_available(&card_reader_tokens) < 4) {
+                  ring_pop(&card_reader_tokens, 4);
+                }
+                ring_write_array(&card_reader_tokens, (uint8_t *)&token, 0, 4);
+                card_reader_play(payload->reader_id, 19);
+                return;
+              } else {
+                console_log("Found dup token\r\n");
+                goto token_is_invalid;
+              }
+            }
+          }
+        }
+        if ((ts / 1000) % 60 < 10) {
+          randkey[3] = randkey[3] - 1;
+          console_log("Randkey: ");
+          console_number(randkey[0]);
+          console_string(", ");
+          console_number(randkey[1]);
+          console_string(", ");
+          console_number(randkey[2]);
+          console_string(", ");
+          console_number(randkey[3]);
+          console_newline();
+          mt19937_init_by_array(randkey, 4);
+          for (uint8_t bi = 1; bi < MAX_LOCK_BOARDS + 1; bi ++) {
+            for (uint8_t lj = 1; lj < 21; lj ++) {
+              uint32_t token = mt19937_uint32() % 1000000;
+              if (token == (uint32_t)payload->token) {
+                console_log("TOKEN-LOCK-OFF board: ");
+                console_number(bi);
+                console_string(", lock: ");
+                console_number(lj);
+                console_newline();
+                lock_off(bi - 1, lj -1, lock_generate_pin(bi, lj, timestamp));
+                card_reader_play(payload->reader_id, 19);
+                return;
+              }
+            }
+          }
+          for (uint8_t bi = 1; bi < MAX_LOCK_BOARDS + 1; bi ++) {
+            for (uint8_t lj = 1; lj < MAX_LOCKS; lj ++) {
+              uint32_t token = mt19937_uint32() % 1000000;
+              if (token == (uint32_t)payload->token) {
+                console_log("TOKEN-LOCKS-OFF board: ");
+                console_number(bi);
+                console_string(", locks: ");
+                console_number(lj);
+                console_string(", ");
+                console_number(lj + 1);
+                console_newline();
+                if (ring_find(&card_reader_tokens, (uint8_t *)&token, 4, NULL) == -1) {
+                  uint8_t locks[2] = {lj - 1, lj};
+                  uint16_t pins[2] = {lock_generate_pin(bi - 1, lj - 1, timestamp), lock_generate_pin(bi - 1, lj, timestamp)};
+                  lock_multi_off(bi - 1, locks, 2, pins, 2);
+                  if (ring_available(&card_reader_tokens) < 4) {
+                    ring_pop(&card_reader_tokens, 4);
+                  }
+                  ring_write_array(&card_reader_tokens, (uint8_t *)&token, 0, 4);
+                  card_reader_play(payload->reader_id, 19);
+                  return;
+                } else {
+                  console_log("Found dup token\r\n");
+                  goto token_is_invalid;
+                }
+              }
+            }
+          }
+        }
+      token_is_invalid:
+        console_log("Token is invalid: ");
+        console_number(payload->token);
+        console_string(", block it\r\n");
+        card_reader_play(payload->reader_id, 20);
+        card_reader_block(payload->reader_id);
+      } else {
+        console_log("Timestamp is invalid for TOKEN-LOCK-OFF: ");
+        console_number(timestamp);
+        console_newline();
+        card_reader_play(payload->reader_id, 15); // say offline notification to card-eader
+      }
+      break;
+    case CARD_READER_ERROR:
+      console_log("Card-reader ERROR\r\n");
+      break;
+    default:
+      console_log("Card-reader unsupported");
+      console_number(payload->cmd);
+      console_string(" from reader ");
+      console_number(payload->reader_id);
+      console_newline();
+      break;
+    }
+  }
+#+end_src
+** 播放语音
+#+begin_src c :noweb-ref play
+  void card_reader_play(uint8_t card_reader, uint16_t audio) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = CARD_READER;
+    packet.devid = card_reader;
+    packet.payload.card_reader.reader_id = card_reader;
+    packet.payload.card_reader.sn = sn++;
+    packet.payload.card_reader.cmd = CARD_READER_PLAY;
+    packet.payload.card_reader.audio = (int16_t)audio;
+    populate_uart3_packet_to_tx(&packet, card_reader_tx);
+  }
+
+  void card_reader_confirm_play(uint8_t card_reader, uint16_t audio, int16_t pin) {
+    parameter_t param;
+    bzero(&param, sizeof(parameter_t));
+    param.sn = sn ++;
+    param.cmd_type = PLAY;
+    param.card_reader = card_reader;
+    param.audio = (int16_t) audio;
+    param.pin = pin;
+    param.rssi = network_rssi;
+    param.ber = network_ber;
+    param.reply_time = network_reply_time;
+    param.ttl = network_ttl;
+    param.network_reset = (int) network_reset_times;
+    param.network_shutdown = (int) network_shutdown_times;
+    uint8_t param_size = packet_calculate_encode_size(&param);
+    uint8_t buf[param_size];
+    uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
+    network_write(buf, bufsize);
+  }
+#+end_src
+** 调节音量
+#+begin_src c :noweb-ref volume
+  void card_reader_volume(uint8_t card_reader, uint8_t volume) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = CARD_READER;
+    packet.devid = card_reader;
+    packet.payload.card_reader.reader_id = card_reader;
+    packet.payload.card_reader.sn = sn++;
+    packet.payload.card_reader.cmd = CARD_READER_VOLUME;
+    packet.payload.card_reader.volume = volume;
+    populate_uart3_packet_to_tx(&packet, card_reader_tx);
+  }
+
+  void card_reader_confirm_volume(uint8_t card_reader, uint8_t volume, int16_t pin) {
+    parameter_t param;
+    bzero(&param, sizeof(parameter_t));
+    param.sn = sn ++;
+    param.cmd_type = VOLUME;
+    param.card_reader = card_reader;
+    param.volume = (int8_t) volume;
+    param.pin = pin;
+    param.rssi = network_rssi;
+    param.ber = network_ber;
+    param.reply_time = network_reply_time;
+    param.ttl = network_ttl;
+    param.network_reset = (int) network_reset_times;
+    param.network_shutdown = (int) network_shutdown_times;
+    uint8_t param_size = packet_calculate_encode_size(&param);
+    uint8_t buf[param_size];
+    uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
+    network_write(buf, bufsize);
+  }
+#+end_src
+** 短暂停用
+#+begin_src c :noweb-ref block
+  void card_reader_block(uint8_t card_reader) {
+    uart3_packet_t packet;
+    bzero(&packet, sizeof(uart3_packet_t));
+    packet.dev_type = CARD_READER;
+    packet.devid = card_reader;
+    packet.payload.card_reader.reader_id = card_reader;
+    packet.payload.card_reader.sn = sn++;
+    packet.payload.card_reader.cmd = CARD_READER_BLOCK;
+    populate_uart3_packet_to_tx(&packet, card_reader_tx);
+  }
+#+end_src
+** 通讯载荷
+#+begin_src c :tangle /dev/shm/boxos/card_payload.h
+  #ifndef _CARD_PAYLOAD_H
+  #define _CARD_PAYLOAD_H
+  #include <stdint.h>
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+    typedef struct card_payload card_payload_t;
+    struct card_payload {
+      uint8_t reader_id;
+      uint8_t cmd;
+      int32_t sn;
+      int32_t card;
+      uint8_t door;
+      int16_t audio;
+      int32_t token;
+      uint8_t volume;
+      int32_t long_door;
+    };
+    int card_payload_calculate_size(card_payload_t *);
+    int card_payload_encode(card_payload_t *, uint8_t *);
+    int card_payload_estimate_size(uint8_t *);
+    int card_payload_decode(uint8_t *, card_payload_t *);
+  #ifdef ZEROPACK_CARD_PAYLOAD_ENABLED
+    int card_payload_encode_zeropack(card_payload_t *, uint8_t *, int);
+    int card_payload_estimate_zeropack_size(uint8_t *, int);
+    int card_payload_decode_zeropack(uint8_t *, int, uint8_t *, card_payload_t *);
+  #endif
+  #ifdef __cplusplus
+  }
+  #endif
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/card_payload.c
+  #include <stdlib.h>
+  #include <string.h>
+  #ifdef ZEROPACK_CARD_PAYLOAD_ENABLED
+  #include "zeropack.h"
+  #endif
+  #include "tightrope.h"
+  #include "card_payload.h"
+  int card_payload_calculate_size(card_payload_t * card_payload) {
+    int size = 2;
+    short tags[9];
+    int len = 0;
+    if (card_payload->reader_id != 0) {
+      tags[len ++] = 0;
+      if (card_payload->reader_id > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (card_payload->cmd != 0) {
+      tags[len ++] = 1;
+      if (card_payload->cmd > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (card_payload->sn != 0) {
+      tags[len ++] = 2;
+      if (card_payload->sn > 0 && card_payload->sn < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (card_payload->card != 0) {
+      tags[len ++] = 3;
+      if (card_payload->card > 0 && card_payload->card < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (card_payload->door != 0) {
+      tags[len ++] = 4;
+      if (card_payload->door > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (card_payload->audio != 0) {
+      tags[len ++] = 5;
+      if (card_payload->audio > 0 && card_payload->audio < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (card_payload->token != 0) {
+      tags[len ++] = 6;
+      if (card_payload->token > 0 && card_payload->token < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (card_payload->volume != 0) {
+      tags[len ++] = 7;
+      if (card_payload->volume > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (card_payload->long_door != 0) {
+      tags[len ++] = 8;
+      if (card_payload->long_door > 0 && card_payload->long_door < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (len > 0) {
+      if (tags[0] != 0) {
+        size += 2;
+      }
+      for (int i = 1; i < len; i ++) {
+        if (tags[i - 1] + 1 != tags[i]) size += 2;
+      }
+    }
+    return size;
+  }
+  static int card_payload_set__fields(card_payload_t * card_payload, uint8_t * buf, short * dtags, int * dlen) {
+    int ptr = 2;
+    short count = 0;
+    for (short tag = 0, nexttag = 0; nexttag < 9; nexttag ++) {
+      switch (nexttag) {
+      case 0:
+        if (card_payload->reader_id != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->reader_id > 0) {
+            short t = (short) ((card_payload->reader_id + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 0;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 1:
+        if (card_payload->cmd != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->cmd > 0) {
+            short t = (short) ((card_payload->cmd + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 1;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 2:
+        if (card_payload->sn != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->sn > 0 && card_payload->sn < 16383) {
+            short t = (short) ((card_payload->sn + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 2;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 3:
+        if (card_payload->card != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->card > 0 && card_payload->card < 16383) {
+            short t = (short) ((card_payload->card + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 3;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 4:
+        if (card_payload->door != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->door > 0) {
+            short t = (short) ((card_payload->door + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 4;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 5:
+        if (card_payload->audio != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->audio > 0 && card_payload->audio < 16383) {
+            short t = (short) ((card_payload->audio + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 5;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 6:
+        if (card_payload->token != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->token > 0 && card_payload->token < 16383) {
+            short t = (short) ((card_payload->token + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 6;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 7:
+        if (card_payload->volume != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->volume > 0) {
+            short t = (short) ((card_payload->volume + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 7;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 8:
+        if (card_payload->long_door != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (card_payload->long_door > 0 && card_payload->long_door < 16383) {
+            short t = (short) ((card_payload->long_door + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 8;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      default:
+        break;
+      }
+    }
+    buf[0] = SHORT0(count);
+    buf[1] = SHORT1(count);
+    return ptr;
+  }
+  static int card_payload_set__data(card_payload_t * card_payload, uint8_t * buf, short * dtags, int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = card_payload->reader_id;
+        break;
+      }
+      case 1: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = card_payload->cmd;
+        break;
+      }
+      case 2: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(card_payload->sn);
+        buf[ptr ++] = INT1(card_payload->sn);
+        buf[ptr ++] = INT2(card_payload->sn);
+        buf[ptr ++] = INT3(card_payload->sn);
+        break;
+      }
+      case 3: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(card_payload->card);
+        buf[ptr ++] = INT1(card_payload->card);
+        buf[ptr ++] = INT2(card_payload->card);
+        buf[ptr ++] = INT3(card_payload->card);
+        break;
+      }
+      case 4: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = card_payload->door;
+        break;
+      }
+      case 5: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(card_payload->audio);
+        buf[ptr ++] = SHORT1(card_payload->audio);
+        break;
+      }
+      case 6: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(card_payload->token);
+        buf[ptr ++] = INT1(card_payload->token);
+        buf[ptr ++] = INT2(card_payload->token);
+        buf[ptr ++] = INT3(card_payload->token);
+        break;
+      }
+      case 7: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = card_payload->volume;
+        break;
+      }
+      case 8: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(card_payload->long_door);
+        buf[ptr ++] = INT1(card_payload->long_door);
+        buf[ptr ++] = INT2(card_payload->long_door);
+        buf[ptr ++] = INT3(card_payload->long_door);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return ptr;
+  }
+  int card_payload_encode(card_payload_t * card_payload, uint8_t * buf) {
+    short dtags[9];
+    int dlen = 0;
+    int ptr0 = card_payload_set__fields(card_payload, buf, dtags, &dlen);
+    int ptr1 = card_payload_set__data(card_payload, buf + ptr0, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_CARD_PAYLOAD_ENABLED
+  int card_payload_encode_zeropack(card_payload_t * card_payload, uint8_t * buf, int len) {
+    uint8_t obuf[len];
+    int size = card_payload_encode(card_payload, obuf);
+    return zeropack(obuf, size, buf);
+  }
+  #endif
+  int card_payload_estimate_size(uint8_t * buf) {
+    int ptr = 0;
+    short tag = 0;
+    short dtags[9];
+    int dlen = 0;
+    int size = sizeof(card_payload_t);
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[dlen ++] = tag;
+        tag ++;
+      } else {
+        tag ++;
+      }
+    }
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 1: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 2: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 3: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 4: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 5: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 6: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 7: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 8: {
+        ptr += 4 + 4;
+        break;
+      }
+      default: {
+        int s = INT(buf + ptr);
+        ptr += 4 + s;
+        break;
+      }
+      }
+    }
+    return size;
+  }
+  #ifdef ZEROPACK_CARD_PAYLOAD_ENABLED
+  int card_payload_estimate_zeropack_size(uint8_t * buf, int len) {
+    uint8_t factor = buf[0];
+    uint8_t uzpbuf[len * factor];
+    unzeropack(buf, len, uzpbuf);
+    return card_payload_estimate_size(uzpbuf);
+  }
+  #endif
+  static int card_payload_parse_fields(uint8_t * buf, card_payload_t * card_payload, short * dtags, int * dlen) {
+    int ptr = 0;
+    short tag = 0;
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[* dlen] = tag;
+        (* dlen) ++;
+        tag ++;
+      } else if (tag == 0) {
+        tag ++;
+        card_payload->reader_id = (value >> 1) - 1;
+      } else if (tag == 1) {
+        tag ++;
+        card_payload->cmd = (value >> 1) - 1;
+      } else if (tag == 2) {
+        tag ++;
+        card_payload->sn = (value >> 1) - 1;
+      } else if (tag == 3) {
+        tag ++;
+        card_payload->card = (value >> 1) - 1;
+      } else if (tag == 4) {
+        tag ++;
+        card_payload->door = (value >> 1) - 1;
+      } else if (tag == 5) {
+        tag ++;
+        card_payload->audio = (value >> 1) - 1;
+      } else if (tag == 6) {
+        tag ++;
+        card_payload->token = (value >> 1) - 1;
+      } else if (tag == 7) {
+        tag ++;
+        card_payload->volume = (value >> 1) - 1;
+      } else if (tag == 8) {
+        tag ++;
+        card_payload->long_door = (value >> 1) - 1;
+      } else {
+        tag ++;
+      }
+    }
+    return ptr;
+  }
+  static int card_payload_parse_data(uint8_t * buf, card_payload_t * card_payload, short * dtags, const int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4;
+        card_payload->reader_id = buf[ptr ++];
+        break;
+      }
+      case 1: {
+        ptr += 4;
+        card_payload->cmd = buf[ptr ++];
+        break;
+      }
+      case 2: {
+        ptr += 4;
+        card_payload->sn = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 3: {
+        ptr += 4;
+        card_payload->card = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 4: {
+        ptr += 4;
+        card_payload->door = buf[ptr ++];
+        break;
+      }
+      case 5: {
+        ptr += 4;
+        card_payload->audio = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 6: {
+        ptr += 4;
+        card_payload->token = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 7: {
+        ptr += 4;
+        card_payload->volume = buf[ptr ++];
+        break;
+      }
+      case 8: {
+        ptr += 4;
+        card_payload->long_door = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      default: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        ptr += size;
+        break;
+      }
+      }
+    }
+    return ptr;
+  }
+  int card_payload_decode(uint8_t * buf, card_payload_t * card_payload) {
+    short dtags[9];
+    int dlen = 0;
+    int ptr0 = card_payload_parse_fields(buf, card_payload, dtags, &dlen);
+    int ptr1 = card_payload_parse_data(buf + ptr0, card_payload, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_CARD_PAYLOAD_ENABLED
+  int card_payload_decode_zeropack(uint8_t * buf, int len, uint8_t * uzpbuf, card_payload_t * card_payload) {
+    unzeropack(buf, len, uzpbuf);
+    return card_payload_decode(uzpbuf, card_payload);
+  }
+  #endif
+#+end_src

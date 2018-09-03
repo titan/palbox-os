@@ -1,0 +1,4 @@
+state\event,"lock off",scan,"status ack, changed","status ack, closed","scan timer",timeout
+READY,,"lock status\SCANNING",,,,
+SCANNING,\READY,,"report
+lock status\",\READY,"lock status\",\READY
