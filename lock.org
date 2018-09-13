@@ -550,11 +550,7 @@
       for (uint8_t i = 0; i < len; i ++) {
         tmp[i + 1] = data[i];
       }
-      if (board < MAX_BOARD) {
-        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_LESS_THAN_MAX_EVENT, tmp);
-      } else {
-        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_EQUALS_MAX_EVENT, tmp);
-      }
+      engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_EVENT, tmp);
       break;
     }
     default:

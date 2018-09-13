@@ -6,11 +6,11 @@
   #include <stdint.h>
 
   #ifdef LOCK_FC
-  #define MAX_LOCK  22
+  #define MAX_LOCK  22 /* 0 to 21 */
   #define MAX_BOARD 8
   #else
-  #define MAX_LOCK 20
-  #define MAX_BOARD 6
+  #define MAX_LOCK  21 /* 1 to 20 */
+  #define MAX_BOARD 7 /* 1 to 6 */
   #endif
 
   extern uint32_t engineer_state;
@@ -94,6 +94,7 @@
   uint8_t lock = 0;
   uint32_t engineer_state = 0;
   uint32_t loop_timer = 0;
+  uint32_t status_timer = 0;
 
   void engineer_setup(void) {
   }
@@ -101,6 +102,7 @@
   void engineer_mainloop(void) {
     light_on();
     ultraviolet_on();
+    status_timer = systick + 199999;
     engineer_state = engineer_transform_state(engineer_state, ENGINEER_START_EVENT, NULL);
 
     while (1) {
@@ -112,13 +114,15 @@
   #else
         loop_timer = systick + 499;
   #endif
-        if (lock < MAX_LOCK && board < MAX_BOARD) {
-          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_LESS_THAN_MAX_SEMI_COLON_BOARD_LESS_THAN_MAX_EVENT, NULL);
-        } else if (lock == MAX_LOCK && board < MAX_BOARD) {
-          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_EQUALS_MAX_SEMI_COLON_BOARD_LESS_THAN_MAX_EVENT, NULL);
-        } else if (lock < MAX_LOCK && board == MAX_BOARD) {
-          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_LESS_THAN_MAX_SEMI_COLON_BOARD_EQUALS_MAX_EVENT, NULL);
+        if (lock < MAX_LOCK) {
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_LESS_THAN_MAX_EVENT, NULL);
+        } else if (lock == MAX_LOCK) {
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_EQUALS_MAX_EVENT, NULL);
         }
+      }
+      if (systick > status_timer) {
+          status_timer = systick + 199999;
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_TIMEOUT_EVENT, NULL);
       }
       uart_eventloop();
     }
@@ -130,13 +134,17 @@
     case ENGINEER_LOCK_ASSIGN_TO_INIT_NEWLINE_BOARD_ASSIGN_TO_INIT_NEWLINE_INFO_ACTION: {
   #ifdef LOCK_FC
       lock = 0;
-  #else
-      lock = 1;
-  #endif
       board = 0;
       console_log("Scanning lock board ");
       console_number(board + 1);
       console_newline();
+  #else
+      lock = 1;
+      board = 1;
+      console_log("Scanning lock board ");
+      console_number(board);
+      console_newline();
+  #endif
       break;
     }
     case ENGINEER_LOCK_OFF_NEWLINE_LOCK_PLUS_1_ACTION: {
@@ -145,28 +153,45 @@
       break;
     }
     case ENGINEER_LOCK_STATUS_NEWLINE_INCREASE_BOARD_OR_RESET_ACTION: {
+  #ifdef LOCK_FC
       console_log("Status ");
       console_number(board + 1);
       console_newline();
+  #else
+      console_log("Status ");
+      console_number(board);
+      console_newline();
+  #endif
       lock_status(board, ((uint16_t)board << 13) | ((uint16_t)lock << 8) | (systick & 0x3F) | 0x80);
+      status_timer = systick + 1999;
       board += 1;
       if (board == MAX_BOARD) {
+  #ifdef LOCK_FC
         board = 0;
+  #else
+        board = 1;
+  #endif
       }
       break;
     }
     case ENGINEER_STATUS_NEWLINE_LOCK_ASSIGN_TO_INIT_NEWLINE_INFO_ACTION: {
+  #ifdef LOCK_FC
       if (data != NULL) {
         status(data[0], data + 1);
       }
-  #ifdef LOCK_FC
       lock = 0;
-  #else
-      lock = 1;
-  #endif
       console_log("Scanning lock board ");
       console_number(board + 1);
       console_newline();
+  #else
+      if (data != NULL) {
+        status(data[0], data + 1);
+      }
+      lock = 1;
+      console_log("Scanning lock board ");
+      console_number(board);
+      console_newline();
+  #endif
       break;
     }
     }
