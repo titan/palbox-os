@@ -678,7 +678,9 @@ UART4 总线上运行的是锁控和充电检测。
   #include "ring.h"
   #include "uart4-fsm.h"
   #include "lock.h"
+  #ifndef ENGINEER_MODE
   #include "charger.h"
+  #endif
   #include "console.h"
 
   #define UART4_TX_BUFFER_SIZE 10
@@ -892,7 +894,9 @@ UART4 总线上运行的是锁控和充电检测。
   void light_setup(void);
   void light_on(void);
   void light_off(void);
+  #ifndef ENGINEER_MODE
   void light_confirm(cmd_type_t type, int16_t pin);
+  #endif
   #endif
 #+end_src
 #+begin_src c :tangle /dev/shm/boxos/light.c
@@ -900,9 +904,7 @@ UART4 总线上运行的是锁控和充电检测。
   #include <libopencm3/stm32/gpio.h>
   #include "light.h"
   #include "defination.h"
-  #include "network.h"
   #include "packet.h"
-  #include "utility.h"
 
   void light_setup() {
     rcc_periph_clock_enable(LIGHT_RCC);
@@ -918,6 +920,9 @@ UART4 总线上运行的是锁控和充电检测。
     gpio_set(LIGHT_PORT, LIGHT_IO);
   }
 
+  #ifndef ENGINEER_MODE
+  #include "network.h"
+  #include "utility.h"
   void light_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
     bzero(&param, sizeof(parameter_t));
@@ -935,6 +940,7 @@ UART4 总线上运行的是锁控和充电检测。
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
     network_write(buf, bufsize);
   }
+  #endif
 #+end_src
 ** 紫外灯
 #+begin_src c :tangle /dev/shm/boxos/ultraviolet.h
@@ -945,7 +951,9 @@ UART4 总线上运行的是锁控和充电检测。
   void ultraviolet_setup(void);
   void ultraviolet_on(void);
   void ultraviolet_off(void);
+  #ifndef ENGINEER_MODE
   void ultraviolet_confirm(cmd_type_t cmd, int16_t pin);
+  #endif
   #endif
 #+end_src
 #+begin_src c :tangle /dev/shm/boxos/ultraviolet.c
@@ -953,8 +961,6 @@ UART4 总线上运行的是锁控和充电检测。
   #include <libopencm3/stm32/gpio.h>
   #include "ultraviolet.h"
   #include "defination.h"
-  #include "network.h"
-  #include "utility.h"
 
   int64_t ultraviolet_start_at = 0;
 
@@ -974,6 +980,9 @@ UART4 总线上运行的是锁控和充电检测。
     ultraviolet_start_at = 0;
   }
 
+  #ifndef ENGINEER_MODE
+  #include "network.h"
+  #include "utility.h"
   void ultraviolet_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
     bzero(&param, sizeof(parameter_t));
@@ -991,6 +1000,7 @@ UART4 总线上运行的是锁控和充电检测。
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
     network_write(buf, bufsize);
   }
+  #endif
 #+end_src
 ** 摄像头
 #+begin_src c :tangle /dev/shm/boxos/camera.h

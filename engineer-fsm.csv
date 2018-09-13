@@ -1,25 +1,15 @@
-state\event,start,"lock status ack, board < max","lock status ack, board = max","lock < max; board < max","lock = max; board < max","lock < max; board = max","lock = max; board = max"
+state\event,start,"lock status ack, board < max","lock status ack, board = max","lock < max; board < max","lock = max; board < max","lock < max; board = max"
 READY,"lock := init
-board := 1
-info
-lock off\LOCKING OFF",,,,,,
-"LOCKING OFF",,,,"lock + 1
-lock off\","lock status\LOCK STATUS","lock + 1
-lock off\","lock status\LOCK STATUS"
+board := init
+info\LOCKING OFF",,,,,
+"LOCKING OFF",,,,"lock off
+lock + 1\","lock status
+increase board or reset\LOCK STATUS","lock off
+lock + 1\"
 "LOCK STATUS",,"status
 lock := init
-board + 1
-info
-lock off\LOCKING OFF","status
+info\LOCKING OFF","status
 lock := init
-board := 1
-info
-lock off\LOCKING OFF",,"status
+info\LOCKING OFF",,"status
 lock := init
-board + 1
-info
-lock off\LOCKING OFF",,"status
-lock := init
-board := 1
-info
-lock off\LOCKING OFF"
+info\LOCKING OFF",

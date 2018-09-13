@@ -1,0 +1,174 @@
+#+STARTUP: indent
+* 工程模式
+#+begin_src c :tangle /dev/shm/boxos/engineer.h
+  #ifndef _ENGINEER_H
+  #define _ENGINEER_H
+  #include <stdint.h>
+
+  #ifdef LOCK_FC
+  #define MAX_LOCK  22
+  #define MAX_BOARD 8
+  #else
+  #define MAX_LOCK 20
+  #define MAX_BOARD 6
+  #endif
+
+  extern uint32_t engineer_state;
+
+  void engineer_setup(void);
+  void engineer_mainloop(void);
+
+  #endif
+#+end_src
+
+#+begin_src c :tangle /dev/shm/boxos/engineer.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/iwdg.h>
+  #include "engineer.h"
+  #include "light.h"
+  #include "ultraviolet.h"
+  #include "engineer-fsm.h"
+  #include "console.h"
+  #include "lock.h"
+
+
+  #ifdef LOCK_FC
+  #define _status_1(board, data, line) do {                               \
+      console_string("Board ");                                           \
+      console_number(board + 1);                                          \
+      console_string(" st ");                                             \
+      console_number(((uint8_t *)data)[0]);                               \
+      console_string(", ");                                               \
+      console_number(((uint8_t *)data)[1]);                               \
+      console_string(", ");                                               \
+      console_number(((uint8_t *)data)[2]);                               \
+      console_newline();                                                  \
+      for (uint8_t i##line = 0; i##line < MAX_LOCK; i##line ++) {         \
+        uint8_t idx##line = (i##line >> 3);                               \
+        uint8_t states##line = (uint8_t)((uint8_t *)data)[idx##line];     \
+        if (((1 << (i##line & 7)) & states##line) == 0) {                 \
+          console_string("Board: ");                                      \
+          console_number(board + 1);                                      \
+          console_string(", ch: ");                                       \
+          if (i##line + 1 < 10) {                                         \
+            console_string(" ");                                          \
+          }                                                               \
+          console_number(i##line + 1);                                    \
+          console_string(", st: failed\r\n");                             \
+        }                                                                 \
+      }                                                                   \
+    } while (0)
+  #else
+  #define _status_1(board, data, line) do {                               \
+      console_string("Board ");                                           \
+      console_number(board + 1);                                          \
+      console_string(" st ");                                             \
+      console_number(((uint8_t *)data)[0]);                               \
+      console_string(", ");                                               \
+      console_number(((uint8_t *)data)[1]);                               \
+      console_string(", ");                                               \
+      console_number(((uint8_t *)data)[2]);                               \
+      console_newline();                                                  \
+      for (uint8_t i##line = 0; i##line < MAX_LOCK; i##line ++) {         \
+        uint8_t idx##line = 3 - (i##line >> 3) - 1;                       \
+        uint8_t states##line = (uint8_t)((uint8_t *)data)[idx##line];     \
+        if (((1 << (i##line & 7)) & states##line) == 0) {                 \
+          console_string("Board: ");                                      \
+          console_number(board + 1);                                      \
+          console_string(", lock: ");                                     \
+          if (i##line + 1 < 10) {                                         \
+            console_string(" ");                                          \
+          }                                                               \
+          console_number(i##line + 1);                                    \
+          console_string(", st: failed\r\n");                             \
+        }                                                                 \
+      }                                                                   \
+    } while (0)
+  #endif
+
+  #define _status_0(board, data, line) _status_1(board, data, line)
+
+  #define status(board, data) _status_0(board, data, __LINE__)
+
+  uint8_t board = 0;
+  uint8_t lock = 0;
+  uint32_t engineer_state = 0;
+  uint32_t loop_timer = 0;
+
+  void engineer_setup(void) {
+  }
+
+  void engineer_mainloop(void) {
+    light_on();
+    ultraviolet_on();
+    engineer_state = engineer_transform_state(engineer_state, ENGINEER_START_EVENT, NULL);
+
+    while (1) {
+      iwdg_reset();
+
+      if (systick > loop_timer) {
+  #ifdef LOCK_FC
+        loop_timer = systick + 1999;
+  #else
+        loop_timer = systick + 499;
+  #endif
+        if (lock < MAX_LOCK && board < MAX_BOARD) {
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_LESS_THAN_MAX_SEMI_COLON_BOARD_LESS_THAN_MAX_EVENT, NULL);
+        } else if (lock == MAX_LOCK && board < MAX_BOARD) {
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_EQUALS_MAX_SEMI_COLON_BOARD_LESS_THAN_MAX_EVENT, NULL);
+        } else if (lock < MAX_LOCK && board == MAX_BOARD) {
+          engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_LESS_THAN_MAX_SEMI_COLON_BOARD_EQUALS_MAX_EVENT, NULL);
+        }
+      }
+      uart_eventloop();
+    }
+  }
+
+  void engineer_do_action(enum ENGINEER_ACTION action, void * dat) {
+    uint8_t * data = (uint8_t *) dat;
+    switch (action) {
+    case ENGINEER_LOCK_ASSIGN_TO_INIT_NEWLINE_BOARD_ASSIGN_TO_INIT_NEWLINE_INFO_ACTION: {
+  #ifdef LOCK_FC
+      lock = 0;
+  #else
+      lock = 1;
+  #endif
+      board = 0;
+      console_log("Scanning lock board ");
+      console_number(board + 1);
+      console_newline();
+      break;
+    }
+    case ENGINEER_LOCK_OFF_NEWLINE_LOCK_PLUS_1_ACTION: {
+      lock_off(board, lock, ((uint16_t)board << 13) | ((uint16_t)lock << 8) | (systick & 0x3F) | 0x40);
+      lock ++;
+      break;
+    }
+    case ENGINEER_LOCK_STATUS_NEWLINE_INCREASE_BOARD_OR_RESET_ACTION: {
+      console_log("Status ");
+      console_number(board + 1);
+      console_newline();
+      lock_status(board, ((uint16_t)board << 13) | ((uint16_t)lock << 8) | (systick & 0x3F) | 0x80);
+      board += 1;
+      if (board == MAX_BOARD) {
+        board = 0;
+      }
+      break;
+    }
+    case ENGINEER_STATUS_NEWLINE_LOCK_ASSIGN_TO_INIT_NEWLINE_INFO_ACTION: {
+      if (data != NULL) {
+        status(data[0], data + 1);
+      }
+  #ifdef LOCK_FC
+      lock = 0;
+  #else
+      lock = 1;
+  #endif
+      console_log("Scanning lock board ");
+      console_number(board + 1);
+      console_newline();
+      break;
+    }
+    }
+  }
+#+end_src

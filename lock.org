@@ -110,17 +110,17 @@
   static struct lock_task_context tasks[32];
   struct board_context bctxs[MAX_LOCK_BOARDS];
 
+  void lock_boot_scan(void) {
+    for (uint8_t board = 0; board < MAX_LOCK_BOARDS; board ++) {
+      bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_SCAN_EVENT, &board);
+    }
+  }
+
   #endif
 
   <<lock-setup>>
 
   void lock_start(void) {
-  }
-
-  void lock_boot_scan(void) {
-    for (uint8_t board = 0; board < MAX_LOCK_BOARDS; board ++) {
-      bctxs[board].state = lockboard_transform_state(bctxs[board].state, LOCKBOARD_SCAN_EVENT, &board);
-    }
   }
 
   <<lock-confirm>>
@@ -544,13 +544,19 @@
     switch (cmd) {
     case LOCK_CMD_OFF:
       break;
-    case LOCK_CMD_STATUS:
+    case LOCK_CMD_STATUS: {
+      uint8_t tmp[len + 1];
+      tmp[0] = board;
+      for (uint8_t i = 0; i < len; i ++) {
+        tmp[i + 1] = data[i];
+      }
       if (board < MAX_BOARD) {
-        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_LESS_THAN_MAX_EVENT, data);
+        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_LESS_THAN_MAX_EVENT, tmp);
       } else {
-        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_EQUALS_MAX_EVENT, data);
+        engineer_state = engineer_transform_state(engineer_state, ENGINEER_LOCK_STATUS_ACK_COMMA_BOARD_EQUALS_MAX_EVENT, tmp);
       }
       break;
+    }
     default:
       break;
     }
@@ -833,6 +839,7 @@
 #+begin_src c :noweb-ref fc-callback
   void lock_fc_callback(uint8_t * buf, uint32_t size) {
     uint8_t base = 0xED; // { 0xAA, 0xFF}
+
     if (buf[size - 1] != crc8_maxim_update(base, buf, size - 1)) {
       // invalid packet
       return;
