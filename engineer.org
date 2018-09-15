@@ -110,7 +110,7 @@
 
       if (systick > loop_timer) {
   #ifdef LOCK_FC
-        loop_timer = systick + 1999;
+        loop_timer = systick + 499;
   #else
         loop_timer = systick + 499;
   #endif

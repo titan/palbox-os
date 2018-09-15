@@ -725,8 +725,12 @@ UART4 总线上运行的是锁控和充电检测。
     ctx->baudrate = 9600;
     ctx->databits = 8;
     ctx->stopbits = 1;
+  #ifdef LOCK_FC
+    ctx->tx_interval = 999; // 1000 ms
+  #else
     ctx->tx_interval = 499; // 500 ms
-    ctx->loop_interval = 999; // 1000 ms
+  #endif
+    ctx->loop_interval = 1; // 1 ms
 
     bzero(&context, sizeof(struct uart4_context_t));
     context.countdown = 0xFFFFFFFF;
