@@ -303,6 +303,19 @@
         confirm.ttl = network_ttl;
         confirm.network_reset = (int) network_reset_times;
         confirm.network_shutdown = (int) network_shutdown_times;
+        confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+        confirm.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+        confirm.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+        confirm.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+        confirm.fireware_version |= (1 << (1 + 16));
+  #endif
         uint8_t confirm_size = packet_calculate_encode_size(&confirm);
         uint8_t buf[confirm_size];
         uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
@@ -335,6 +348,19 @@
         confirm.ttl = network_ttl;
         confirm.network_reset = (int) network_reset_times;
         confirm.network_shutdown = (int) network_shutdown_times;
+        confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+        confirm.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+        confirm.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+        confirm.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+        confirm.fireware_version |= (1 << (1 + 16));
+  #endif
         uint8_t confirm_size = packet_calculate_encode_size(&confirm);
         uint8_t buf[confirm_size];
         uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);

@@ -939,6 +939,19 @@ UART4 总线上运行的是锁控和充电检测。
     param.ttl = network_ttl;
     param.network_reset = (int) network_reset_times;
     param.network_shutdown = (int) network_shutdown_times;
+    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+    param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+    param.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+    param.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+    param.fireware_version |= (1 << (1 + 16));
+  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -999,6 +1012,19 @@ UART4 总线上运行的是锁控和充电检测。
     param.ttl = network_ttl;
     param.network_reset = (int) network_reset_times;
     param.network_shutdown = (int) network_shutdown_times;
+    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+    param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+    param.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+    param.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+    param.fireware_version |= (1 << (1 + 16));
+  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -1052,6 +1078,19 @@ UART4 总线上运行的是锁控和充电检测。
     param.ttl = network_ttl;
     param.network_reset = (int) network_reset_times;
     param.network_shutdown = (int) network_shutdown_times;
+    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+    param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+    param.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+    param.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+    param.fireware_version |= (1 << (1 + 16));
+  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -1104,6 +1143,19 @@ UART4 总线上运行的是锁控和充电检测。
     param.ttl = network_ttl;
     param.network_reset = (int) network_reset_times;
     param.network_shutdown = (int) network_shutdown_times;
+    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+    param.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+    param.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+    param.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+    param.fireware_version |= (1 << (1 + 16));
+  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
