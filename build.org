@@ -324,10 +324,10 @@
   OBJS += ring.o console.o utility.o hash.o led.o light.o ultraviolet.o uart.o uart4-fsm.o uart4.o engineer-fsm.o engineer.o
   CFLAGS += -DENGINEER_MODE
   else
-  OBJS += base64.o ring.o lockboard-fsm.o console.o light.o ultraviolet.o camera.o zeropack.o packet.o parameter.o fan.o utility.o card-reader.o card_payload.o upstream-fsm.o upstream.o mt19937.o network.o led.o charger_payload.o charger-packet.o charger-fsm.o charger.o egg_payload.o egg-fsm.o egg.o hash.o uart.o uart4-fsm.o uart4.o uart3_payload.o uart3-packet.o uart3-fsm.o uart3.o
+  OBJS += base64.o ring.o lockboard-fsm.o console.o light.o ultraviolet.o camera.o zeropack.o packet.o parameter.o fan.o utility.o card-reader.o card_payload.o upstream-fsm.o upstream.o mt19937.o network.o led.o charger_payload.o charger-fsm.o charger.o egg_payload.o egg-fsm.o egg.o hash.o uart.o uart4-packet.o uart4-fsm.o uart4.o uart3_payload.o uart3-packet.o uart3-fsm.o uart3.o rfid_payload.o rfid-reader-fsm.o rfid-reader.o
   endif
 
-  CFLAGS += -DZEROPACK_PARAMETER_ENABLED -DZEROPACK_CARD_PAYLOAD_ENABLED -DAPIVERSION=$(APIVERSION) -DZEROPACK_CHARGER_PAYLOAD_ENABLED -DZEROPACK_UART3_PAYLOAD_ENABLED -DZEROPACK_EGG_PAYLOAD_ENABLED
+  CFLAGS += -DZEROPACK_PARAMETER_ENABLED -DZEROPACK_CARD_PAYLOAD_ENABLED -DAPIVERSION=$(APIVERSION) -DZEROPACK_CHARGER_PAYLOAD_ENABLED -DZEROPACK_UART3_PAYLOAD_ENABLED -DZEROPACK_EGG_PAYLOAD_ENABLED -DZEROPACK_RFID_PAYLOAD_ENABLED
 
   ifdef DEBUG
   CFLAGS += -DDEBUG

@@ -280,7 +280,7 @@
   void card_reader_play(uint8_t card_reader, uint16_t audio) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = CARD_READER;
+    packet.devtype = CARD_READER;
     packet.devid = card_reader;
     packet.payload.card_reader.reader_id = card_reader;
     packet.payload.card_reader.sn = sn++;
@@ -327,7 +327,7 @@
   void card_reader_volume(uint8_t card_reader, uint8_t volume) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = CARD_READER;
+    packet.devtype = CARD_READER;
     packet.devid = card_reader;
     packet.payload.card_reader.reader_id = card_reader;
     packet.payload.card_reader.sn = sn++;
@@ -374,7 +374,7 @@
   void card_reader_block(uint8_t card_reader) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = CARD_READER;
+    packet.devtype = CARD_READER;
     packet.devid = card_reader;
     packet.payload.card_reader.reader_id = card_reader;
     packet.payload.card_reader.sn = sn++;

@@ -1,0 +1,1177 @@
+#+STARTUP: indent
+* RFID系统
+** 基本框架
+#+begin_src c :tangle /dev/shm/boxos/rfid-reader.h
+  #ifndef _RFID_READER_H
+  #define _RFID_READER_H
+  #include <stdint.h>
+  #include "ring.h"
+  #include "uart4-packet.h"
+
+  #define MAX_RFID_READER_BIT 2
+  #define MAX_RFID_READERS (2 << (MAX_RFID_READER_BIT - 1))
+
+  void rfid_reader_setup(struct ring_t * tx, struct ring_t * rx);
+  void rfid_reader_start(void);
+  void rfid_reader_boot_scan(void);
+  void rfid_reader_eventloop(void);
+  void rfid_reader_callback(uart4_packet_t * packet);
+  <<inventory-prototype>>
+  <<difference-prototype>>
+  <<fetch-data-prototype>>
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/rfid-reader.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "defination.h"
+  #include "rfid-reader.h"
+  #include "packet.h"
+  #include "network.h"
+  #include "console.h"
+  #include "utility.h"
+  #include "uart.h"
+  #include "ring.h"
+  #include "rfid-reader-fsm.h"
+
+  <<cmd>>
+
+  struct rfid_reader_context {
+    uint32_t state;
+    uint32_t cmd_timer;
+    uint32_t cmd_interval;
+    uint32_t retry;
+    uint16_t pin;
+    uint16_t offset;
+    uint16_t num;
+    uint8_t door;
+    uint8_t scope;
+  };
+
+  static struct rfid_reader_context ctxs[MAX_RFID_READERS];
+
+  static struct ring_t * rfid_reader_tx;
+  static struct ring_t * rfid_reader_rx;
+
+  static uint32_t loop_timer;
+  static uint8_t activated;
+
+  <<setup>>
+  void rfid_reader_start() {
+  }
+
+  void rfid_reader_boot_scan(void) {
+  /*
+    for (uint8_t i = 0; i < MAX_RFID_READERS; i ++) {
+      ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_ONLINE_COMMA_TX_FREE_EVENT, &i);
+    }
+    ,*/
+  }
+
+  <<mainloop>>
+  <<callback>>
+  <<inventory>>
+  <<difference>>
+  <<fetch-data>>
+  <<fsm>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  void rfid_reader_setup(struct ring_t * tx, struct ring_t * rx) {
+    rfid_reader_tx = tx;
+    rfid_reader_rx = rx;
+    loop_timer = 0;
+    activated = 0;
+
+    for (uint8_t i = 0; i < MAX_RFID_READERS; i ++) {
+      bzero(&ctxs[i], sizeof(struct rfid_reader_context));
+      ctxs[i].state = RFID_READER_READY_STATE;
+      ctxs[i].cmd_timer = systick;
+      ctxs[i].cmd_interval = 499; // 500 ms
+    }
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref mainloop
+  void rfid_reader_eventloop() {
+    if (systick > loop_timer) {
+      loop_timer = systick + 999; // interval of 1 seconds
+      for (uint8_t i = 0; i < MAX_RFID_READERS; i ++) {
+        if ((activated & (1 << i)) == 0) continue;
+        if (ctxs[i].state == RFID_READER_INVENTORYING_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        } else if (ctxs[i].state == RFID_READER_DIFFERENCING_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        } else if (ctxs[i].state == RFID_READER_DATING_STATE) {
+          if (ctxs[i].retry == 0) {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
+          } else {
+            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
+          }
+        }
+      }
+    }
+  }
+#+end_src
+** 协议回调
+#+begin_src c :noweb-ref callback
+  void rfid_reader_callback(uart4_packet_t * packet) {
+    switch (packet->payload.rfid_reader.cmd) {
+    case RFID_READER_INVENTORY_RESPONSE: {
+      uint8_t idx = packet->devid - 1;
+      activated |= 1 << idx;
+      ctxs[idx].pin = packet->payload.rfid_reader.sn;
+      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_ACK_EVENT, &idx);
+      break;
+    }
+    case RFID_READER_DIFFERENCE_RESPONSE: {
+      uint8_t idx = packet->devid - 1;
+      activated |= 1 << idx;
+      ctxs[idx].pin = packet->payload.rfid_reader.sn;
+      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_ACK_EVENT, &idx);
+      break;
+    }
+    case RFID_READER_DATA_RESPONSE: {
+      uint8_t idx = packet->devid - 1;
+      activated |= 1 << idx;
+      ctxs[idx].pin = packet->payload.rfid_reader.sn;
+      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_EVENT, &idx);
+      break;
+    }
+    default:
+      console_log("Unknown command ");
+      console_number(packet->payload.rfid_reader.cmd);
+      console_string(" from rfid-reader ");
+      console_number(packet->devid);
+      console_newline();
+      break;
+    }
+  }
+#+end_src
+** 状态机
+#+begin_src c :noweb-ref fsm
+  void rfid_reader_do_action(enum RFID_READER_ACTION action, void * data) {
+    uint8_t idx = * (uint8_t *) data;
+    switch (action) {
+    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
+      ctxs[idx].retry = 10;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      inventory(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = RFID_READER_INVENTORY;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.door = ctxs[idx].door;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+      confirm.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+      confirm.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+      confirm.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+      confirm.fireware_version |= (1 << (1 + 16));
+  #endif
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm RFID-READER-INVENTORY (");
+      console_number(idx + 1);
+      console_string(", door: ");
+      console_number(ctxs[idx].door);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+      break;
+    }
+    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
+      ctxs[idx].retry = 10;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      difference(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = RFID_READER_DIFFERENCE;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.door = ctxs[idx].door;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+      confirm.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+      confirm.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+      confirm.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+      confirm.fireware_version |= (1 << (1 + 16));
+  #endif
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm RFID-READER-INVENTORY (");
+      console_number(idx + 1);
+      console_string(", door: ");
+      console_number(ctxs[idx].door);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+      break;
+    }
+    case RFID_READER_SET_RETRY_EQUALS_3_NEWLINE_SET_CMD_TIMER_NEWLINE_DATA_ACTION:
+      ctxs[idx].retry = 3;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
+      break;
+    case RFID_READER_INVENTORY_RESULT_ACTION:
+      break;
+    case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_INVENTORY_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      inventory(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      break;
+    case RFID_READER_DIFFERENCE_RESULT_ACTION:
+      break;
+    case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_DIFFERENCE_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      difference(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      break;
+    case RFID_READER_ACK_DATA_ACTION: {
+      parameter_t confirm;
+      bzero(&confirm, sizeof(parameter_t));
+      confirm.sn = sn ++;
+      confirm.cmd_type = RFID_READER_DATA;
+      confirm.pin = ctxs[idx].pin;
+      confirm.board = idx + 1;
+      confirm.rssi = network_rssi;
+      confirm.ber = network_ber;
+      confirm.network_reset = (int) network_reset_times;
+      confirm.network_shutdown = (int) network_shutdown_times;
+      confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
+  #ifdef LOCK_FC
+      confirm.fireware_version |= (1 << (5 + 16));
+  #endif
+  #ifdef LOCK_DGZL
+      confirm.fireware_version |= (1 << (4 + 16));
+  #endif
+  #ifdef EC20
+      confirm.fireware_version |= (1 << (2 + 16));
+  #endif
+  #ifdef ESP8266
+      confirm.fireware_version |= (1 << (1 + 16));
+  #endif
+      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
+      uint8_t ebuf[confirm_size];
+      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
+      network_write(ebuf, bufsize);
+      console_log("Confirm RFID-READER-DATA (");
+      console_number(idx + 1);
+      console_string(", pin: ");
+      console_number(ctxs[idx].pin);
+      console_string(")\r\n");
+      break;
+    }
+    case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_DATA_ACTION:
+      ctxs[idx].retry --;
+      ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
+      break;
+    }
+  }
+#+end_src
+** 对外接口
+*** 盘库
+#+begin_src c :noweb-ref inventory-prototype
+  void rfid_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+#+end_src
+#+begin_src c :noweb-ref inventory
+  static void inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+    uart4_packet_t packet;
+    bzero(&packet, sizeof(uart4_packet_t));
+    packet.devid = rfid_reader;
+    packet.devtype = RFID_READER;
+    packet.version = 0;
+    packet.payload.rfid_reader.sn = pin;
+    packet.payload.rfid_reader.cmd = RFID_READER_INVENTORY_REQUEST;
+    packet.payload.rfid_reader.door = door;
+    populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
+  }
+
+  void rfid_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+    uint8_t idx = rfid_reader - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].door = door;
+    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_EVENT, &idx);
+  }
+#+end_src
+*** 差集
+#+begin_src c :noweb-ref difference-prototype
+  void rfid_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+#+end_src
+#+begin_src c :noweb-ref difference
+  static void difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+    uart4_packet_t packet;
+    bzero(&packet, sizeof(uart4_packet_t));
+    packet.devid = rfid_reader;
+    packet.devtype = RFID_READER;
+    packet.version = 0;
+    packet.payload.rfid_reader.sn = pin;
+    packet.payload.rfid_reader.cmd = RFID_READER_DIFFERENCE_REQUEST;
+    packet.payload.rfid_reader.door = door;
+    populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
+  }
+
+  void rfid_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+    uint8_t idx = rfid_reader - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].door = door;
+    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_EVENT, &idx);
+  }
+#+end_src
+*** 获取数据
+#+begin_src c :noweb-ref fetch-data-prototype
+  void rfid_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin);
+#+end_src
+#+begin_src c :noweb-ref fetch-data
+  static void fetch_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
+    uart4_packet_t packet;
+    bzero(&packet, sizeof(uart4_packet_t));
+    packet.devid = rfid_reader;
+    packet.devtype = RFID_READER;
+    packet.version = 0;
+    packet.payload.rfid_reader.sn = pin;
+    packet.payload.rfid_reader.cmd = RFID_READER_DATA_REQUEST;
+    packet.payload.rfid_reader.data_scope = scope;
+    packet.payload.rfid_reader.offset = offset;
+    packet.payload.rfid_reader.len = num;
+    populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
+  }
+
+  void rfid_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
+    uint8_t idx = rfid_reader - 1;
+    ctxs[idx].pin = pin;
+    ctxs[idx].scope = scope;
+    ctxs[idx].offset = offset;
+    ctxs[idx].num = num;
+    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_EVENT, &idx);
+  }
+#+end_src
+** 通讯协议
+*** 命令编号
+
+| 编号 | 名称                | 方向   | 说明     |
+|------+---------------------+--------+----------|
+| 0x01 | error               | 下->上 | 错误     |
+| 0x02 | inventory-request   | 上->下 | 盘库请求 |
+| 0x03 | inventory-response  | 下->上 | 盘库响应 |
+| 0x04 | difference-request  | 上->下 | 差异请求 |
+| 0x05 | difference-response | 下->上 | 差异响应 |
+| 0x06 | data-request        | 上->下 | 数据请求 |
+| 0x07 | data-response       | 下->上 | 数据请求 |
+
+
+#+begin_src c :noweb-ref cmd
+  typedef enum RFID_READER_CMD_TYPE {
+    RFID_READER_UNKNOWN = 0x00,
+    RFID_READER_ERROR = 0x01,
+    RFID_READER_INVENTORY_REQUEST = 0x02,
+    RFID_READER_INVENTORY_RESPONSE = 0x03,
+    RFID_READER_DIFFERENCE_REQUEST = 0x04,
+    RFID_READER_DIFFERENCE_RESPONSE = 0x05,
+    RFID_READER_DATA_REQUEST = 0x06,
+    RFID_READER_DATA_RESPONSE = 0x07,
+  } rfid_reader_cmd_type_t;
+
+  enum RFID_READER_DATA_SCOPE {
+    RFID_READER_INCREMENT_SCOPE = 0x01,
+    RFID_READER_DECREMENT_SCOPE = 0x02,
+    RFID_READER_TOTAL_SCOPE = 0x03,
+  };
+#+end_src
+
+*** 命令参数矩阵
+
+| 命令     | 错误编号 | 门号 | 总量 | 增量 | 减量 | 数据范围 | 偏移量 | 数据区 |
+|----------+----------+------+------+------+------+----------+--------+--------|
+| 错误     | ✓        |      |      |      |      |          |        |        |
+| 盘库请求 |          | ✓    |      |      |      |          |        |        |
+| 盘库响应 |          | ✓    | ✓    |      |      |          |        |        |
+| 差异请求 |          | ✓    |      |      |      |          |        |        |
+| 差异响应 |          | ✓    |      | ✓    | ✓    |          |        |        |
+| 数据请求 |          |      | ✓    |      |      | ✓        | ✓      |        |
+| 数据响应 |          |      | ✓    |      |      | ✓        | ✓      | ✓      |
+
+*** 有效载荷
+通讯载荷的代码来源于 rfid-reader 项目。
+#+begin_src c :tangle /dev/shm/boxos/rfid_payload.h
+  #ifndef _RFID_PAYLOAD_H
+  #define _RFID_PAYLOAD_H
+  #include <stdint.h>
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+    typedef struct rfid_payload rfid_payload_t;
+    struct rfid_payload {
+      uint8_t reader_id;
+      uint8_t cmd;
+      int32_t sn;
+      uint8_t errno;
+      uint8_t door;
+      int16_t len;
+      int16_t increment;
+      int16_t decrement;
+      uint8_t data_scope;
+      int16_t offset;
+      uint8_t * data;
+      int __data_len;
+      uint8_t * distribution;
+      int __distribution_len;
+    };
+    int rfid_payload_calculate_size(rfid_payload_t *);
+    int rfid_payload_encode(rfid_payload_t *, uint8_t *);
+    int rfid_payload_estimate_size(uint8_t *);
+    int rfid_payload_decode(uint8_t *, rfid_payload_t *);
+  #ifdef ZEROPACK_RFID_PAYLOAD_ENABLED
+    int rfid_payload_encode_zeropack(rfid_payload_t *, uint8_t *, int);
+    int rfid_payload_estimate_zeropack_size(uint8_t *, int);
+    int rfid_payload_decode_zeropack(uint8_t *, int, uint8_t *, rfid_payload_t *);
+  #endif
+    static inline void rfid_payload_set_distribution(rfid_payload_t * rfid_payload, uint8_t * distribution, int len) {
+      rfid_payload->distribution = distribution;
+      rfid_payload->__distribution_len = len;
+    }
+    static inline void rfid_payload_set_data(rfid_payload_t * rfid_payload, uint8_t * data, int len) {
+      rfid_payload->data = data;
+      rfid_payload->__data_len = len;
+    }
+    static inline int rfid_payload_get_distribution_len(rfid_payload_t * rfid_payload) {
+      return rfid_payload->__distribution_len;
+    }
+    static inline int rfid_payload_get_data_len(rfid_payload_t * rfid_payload) {
+      return rfid_payload->__data_len;
+    }
+  #ifdef __cplusplus
+  }
+  #endif
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/rfid_payload.c
+  #include <stdlib.h>
+  #include <string.h>
+  #ifdef ZEROPACK_RFID_PAYLOAD_ENABLED
+  #include "zeropack.h"
+  #endif
+  #include "tightrope.h"
+  #include "rfid_payload.h"
+  int rfid_payload_calculate_size(rfid_payload_t * rfid_payload) {
+    int size = 2;
+    short tags[12];
+    int len = 0;
+    if (rfid_payload->reader_id != 0) {
+      tags[len ++] = 0;
+      if (rfid_payload->reader_id > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (rfid_payload->cmd != 0) {
+      tags[len ++] = 1;
+      if (rfid_payload->cmd > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (rfid_payload->sn != 0) {
+      tags[len ++] = 2;
+      if (rfid_payload->sn > 0 && rfid_payload->sn < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (rfid_payload->errno != 0) {
+      tags[len ++] = 3;
+      if (rfid_payload->errno > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (rfid_payload->door != 0) {
+      tags[len ++] = 4;
+      if (rfid_payload->door > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (rfid_payload->len != 0) {
+      tags[len ++] = 5;
+      if (rfid_payload->len > 0 && rfid_payload->len < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (rfid_payload->increment != 0) {
+      tags[len ++] = 6;
+      if (rfid_payload->increment > 0 && rfid_payload->increment < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (rfid_payload->decrement != 0) {
+      tags[len ++] = 7;
+      if (rfid_payload->decrement > 0 && rfid_payload->decrement < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (rfid_payload->data_scope != 0) {
+      tags[len ++] = 8;
+      if (rfid_payload->data_scope > 0) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 1;
+      }
+    }
+    if (rfid_payload->offset != 0) {
+      tags[len ++] = 9;
+      if (rfid_payload->offset > 0 && rfid_payload->offset < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 2;
+      }
+    }
+    if (rfid_payload->data != NULL) {
+      tags[len ++] = 10;
+      size += 2 + 4 + rfid_payload->__data_len * 1;
+    }
+    if (rfid_payload->distribution != NULL) {
+      tags[len ++] = 11;
+      size += 2 + 4 + rfid_payload->__distribution_len * 1;
+    }
+    if (len > 0) {
+      if (tags[0] != 0) {
+        size += 2;
+      }
+      for (int i = 1; i < len; i ++) {
+        if (tags[i - 1] + 1 != tags[i]) size += 2;
+      }
+    }
+    return size;
+  }
+  static int rfid_payload_set__fields(rfid_payload_t * rfid_payload, uint8_t * buf, short * dtags, int * dlen) {
+    int ptr = 2;
+    short count = 0;
+    for (short tag = 0, nexttag = 0; nexttag < 12; nexttag ++) {
+      switch (nexttag) {
+      case 0:
+        if (rfid_payload->reader_id != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->reader_id > 0) {
+            short t = (short) ((rfid_payload->reader_id + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 0;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 1:
+        if (rfid_payload->cmd != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->cmd > 0) {
+            short t = (short) ((rfid_payload->cmd + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 1;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 2:
+        if (rfid_payload->sn != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->sn > 0 && rfid_payload->sn < 16383) {
+            short t = (short) ((rfid_payload->sn + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 2;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 3:
+        if (rfid_payload->errno != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->errno > 0) {
+            short t = (short) ((rfid_payload->errno + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 3;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 4:
+        if (rfid_payload->door != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->door > 0) {
+            short t = (short) ((rfid_payload->door + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 4;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 5:
+        if (rfid_payload->len != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->len > 0 && rfid_payload->len < 16383) {
+            short t = (short) ((rfid_payload->len + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 5;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 6:
+        if (rfid_payload->increment != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->increment > 0 && rfid_payload->increment < 16383) {
+            short t = (short) ((rfid_payload->increment + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 6;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 7:
+        if (rfid_payload->decrement != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->decrement > 0 && rfid_payload->decrement < 16383) {
+            short t = (short) ((rfid_payload->decrement + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 7;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 8:
+        if (rfid_payload->data_scope != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->data_scope > 0) {
+            short t = (short) ((rfid_payload->data_scope + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 8;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 9:
+        if (rfid_payload->offset != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->offset > 0 && rfid_payload->offset < 16383) {
+            short t = (short) ((rfid_payload->offset + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 9;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 10:
+        if (rfid_payload->data != NULL) {
+          dtags[* dlen] = 10;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      case 11:
+        if (rfid_payload->distribution != NULL) {
+          dtags[* dlen] = 11;
+          (* dlen) ++;
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          buf[ptr ++] = 0;
+          buf[ptr ++] = 0;
+          tag = nexttag + 1;
+        }
+      break;
+      default:
+        break;
+      }
+    }
+    buf[0] = SHORT0(count);
+    buf[1] = SHORT1(count);
+    return ptr;
+  }
+  static int rfid_payload_set__data(rfid_payload_t * rfid_payload, uint8_t * buf, short * dtags, int dlen) {
+    int ptr = 0;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = rfid_payload->reader_id;
+        break;
+      }
+      case 1: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = rfid_payload->cmd;
+        break;
+      }
+      case 2: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(rfid_payload->sn);
+        buf[ptr ++] = INT1(rfid_payload->sn);
+        buf[ptr ++] = INT2(rfid_payload->sn);
+        buf[ptr ++] = INT3(rfid_payload->sn);
+        break;
+      }
+      case 3: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = rfid_payload->errno;
+        break;
+      }
+      case 4: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = rfid_payload->door;
+        break;
+      }
+      case 5: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(rfid_payload->len);
+        buf[ptr ++] = SHORT1(rfid_payload->len);
+        break;
+      }
+      case 6: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(rfid_payload->increment);
+        buf[ptr ++] = SHORT1(rfid_payload->increment);
+        break;
+      }
+      case 7: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(rfid_payload->decrement);
+        buf[ptr ++] = SHORT1(rfid_payload->decrement);
+        break;
+      }
+      case 8: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 1;
+        buf[ptr ++] = rfid_payload->data_scope;
+        break;
+      }
+      case 9: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 2;
+        buf[ptr ++] = SHORT0(rfid_payload->offset);
+        buf[ptr ++] = SHORT1(rfid_payload->offset);
+        break;
+      }
+      case 10: {
+        int size = rfid_payload->__data_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < rfid_payload->__data_len; j ++) {
+          buf[ptr ++] = rfid_payload->data[j];
+        }
+        break;
+      }
+      case 11: {
+        int size = rfid_payload->__distribution_len;
+        buf[ptr ++] = INT0(size);
+        buf[ptr ++] = INT1(size);
+        buf[ptr ++] = INT2(size);
+        buf[ptr ++] = INT3(size);
+        for (int j = 0; j < rfid_payload->__distribution_len; j ++) {
+          buf[ptr ++] = rfid_payload->distribution[j];
+        }
+        break;
+      }
+      default:
+        break;
+      }
+    }
+    return ptr;
+  }
+  int rfid_payload_encode(rfid_payload_t * rfid_payload, uint8_t * buf) {
+    short dtags[12];
+    int dlen = 0;
+    int ptr0 = rfid_payload_set__fields(rfid_payload, buf, dtags, &dlen);
+    int ptr1 = rfid_payload_set__data(rfid_payload, buf + ptr0, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_RFID_PAYLOAD_ENABLED
+  int rfid_payload_encode_zeropack(rfid_payload_t * rfid_payload, uint8_t * buf, int len) {
+    uint8_t obuf[len];
+    int size = rfid_payload_encode(rfid_payload, obuf);
+    return zeropack(obuf, size, buf);
+  }
+  #endif
+  int rfid_payload_estimate_size(uint8_t * buf) {
+    int ptr = 0;
+    short tag = 0;
+    short dtags[12];
+    int dlen = 0;
+    int size = sizeof(rfid_payload_t);
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[dlen ++] = tag;
+        tag ++;
+      } else {
+        tag ++;
+      }
+    }
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 1: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 2: {
+        ptr += 4 + 4;
+        break;
+      }
+      case 3: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 4: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 5: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 6: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 7: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 8: {
+        ptr += 4 + 1;
+        break;
+      }
+      case 9: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 10: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      case 11: {
+        int s = INT(buf + ptr);
+        ptr += s + 4;
+        size += s;
+        break;
+      }
+      default: {
+        int s = INT(buf + ptr);
+        ptr += 4 + s;
+        break;
+      }
+      }
+    }
+    return size;
+  }
+  #ifdef ZEROPACK_RFID_PAYLOAD_ENABLED
+  int rfid_payload_estimate_zeropack_size(uint8_t * buf, int len) {
+    uint8_t factor = buf[0];
+    uint8_t uzpbuf[len * factor];
+    unzeropack(buf, len, uzpbuf);
+    return rfid_payload_estimate_size(uzpbuf);
+  }
+  #endif
+  static int rfid_payload_parse_fields(uint8_t * buf, rfid_payload_t * rfid_payload, short * dtags, int * dlen) {
+    int ptr = 0;
+    short tag = 0;
+    short count = SHORT(buf);
+    ptr += 2;
+    for (short i = 0; i < count; i ++) {
+      short value = SHORT(buf + ptr);
+      ptr += 2;
+      if ((value & 0x01) == 1) {
+        tag += (value - 1) >> 1;
+      } else if (value == 0) {
+        dtags[* dlen] = tag;
+        (* dlen) ++;
+        tag ++;
+      } else if (tag == 0) {
+        tag ++;
+        rfid_payload->reader_id = (value >> 1) - 1;
+      } else if (tag == 1) {
+        tag ++;
+        rfid_payload->cmd = (value >> 1) - 1;
+      } else if (tag == 2) {
+        tag ++;
+        rfid_payload->sn = (value >> 1) - 1;
+      } else if (tag == 3) {
+        tag ++;
+        rfid_payload->errno = (value >> 1) - 1;
+      } else if (tag == 4) {
+        tag ++;
+        rfid_payload->door = (value >> 1) - 1;
+      } else if (tag == 5) {
+        tag ++;
+        rfid_payload->len = (value >> 1) - 1;
+      } else if (tag == 6) {
+        tag ++;
+        rfid_payload->increment = (value >> 1) - 1;
+      } else if (tag == 7) {
+        tag ++;
+        rfid_payload->decrement = (value >> 1) - 1;
+      } else if (tag == 8) {
+        tag ++;
+        rfid_payload->data_scope = (value >> 1) - 1;
+      } else if (tag == 9) {
+        tag ++;
+        rfid_payload->offset = (value >> 1) - 1;
+      } else {
+        tag ++;
+      }
+    }
+    return ptr;
+  }
+  static int rfid_payload_parse_data(uint8_t * buf, rfid_payload_t * rfid_payload, short * dtags, const int dlen) {
+    int ptr = 0;
+    int sptr = sizeof(rfid_payload_t);
+    uint8_t * addr = (uint8_t *)rfid_payload;
+    for (int i = 0; i < dlen; i ++) {
+      switch (dtags[i]) {
+      case 0: {
+        ptr += 4;
+        rfid_payload->reader_id = buf[ptr ++];
+        break;
+      }
+      case 1: {
+        ptr += 4;
+        rfid_payload->cmd = buf[ptr ++];
+        break;
+      }
+      case 2: {
+        ptr += 4;
+        rfid_payload->sn = INT(buf + ptr);
+        ptr += 4;
+        break;
+      }
+      case 3: {
+        ptr += 4;
+        rfid_payload->errno = buf[ptr ++];
+        break;
+      }
+      case 4: {
+        ptr += 4;
+        rfid_payload->door = buf[ptr ++];
+        break;
+      }
+      case 5: {
+        ptr += 4;
+        rfid_payload->len = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 6: {
+        ptr += 4;
+        rfid_payload->increment = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 7: {
+        ptr += 4;
+        rfid_payload->decrement = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 8: {
+        ptr += 4;
+        rfid_payload->data_scope = buf[ptr ++];
+        break;
+      }
+      case 9: {
+        ptr += 4;
+        rfid_payload->offset = SHORT(buf + ptr);
+        ptr += 2;
+        break;
+      }
+      case 10: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        rfid_payload->__data_len = size;
+        rfid_payload->data = (uint8_t *)(addr + sptr);
+        memcpy(rfid_payload->data, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      case 11: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        rfid_payload->__distribution_len = size;
+        rfid_payload->distribution = (uint8_t *)(addr + sptr);
+        memcpy(rfid_payload->distribution, buf + ptr, size);
+        ptr += size;
+        sptr += size;
+        break;
+      }
+      default: {
+        int size = INT(buf + ptr);
+        ptr += 4;
+        ptr += size;
+        break;
+      }
+      }
+    }
+    return ptr;
+  }
+  int rfid_payload_decode(uint8_t * buf, rfid_payload_t * rfid_payload) {
+    short dtags[12];
+    int dlen = 0;
+    int ptr0 = rfid_payload_parse_fields(buf, rfid_payload, dtags, &dlen);
+    int ptr1 = rfid_payload_parse_data(buf + ptr0, rfid_payload, dtags, dlen);
+    return ptr0 + ptr1;
+  }
+  #ifdef ZEROPACK_RFID_PAYLOAD_ENABLED
+  int rfid_payload_decode_zeropack(uint8_t * buf, int len, uint8_t * uzpbuf, rfid_payload_t * rfid_payload) {
+    unzeropack(buf, len, uzpbuf);
+    return rfid_payload_decode(uzpbuf, rfid_payload);
+  }
+  #endif
+#+end_src

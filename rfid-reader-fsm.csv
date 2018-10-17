@@ -1,0 +1,37 @@
+state\event,inventory,"inventory ack",difference,"difference ack",data,"data ack","cmd timeout, retry > 0","cmd timeout, retry == 0"
+READY,"set retry = 10
+set cmd timer
+inventory
+ack
+----
+INVENTORYING",,"set retry = 10
+set cmd timer
+difference
+ack
+----
+DIFFERENCING",,"set retry = 3
+set cmd timer
+data
+----
+DATING",,,
+INVENTORYING,,"inventory result
+----
+READY",,,,,"retry - 1
+set cmd timer
+inventory
+----","----
+READY"
+DIFFERENCING,,,,"difference result
+----
+READY",,,"retry - 1
+set cmd timer
+difference
+----","----
+READY"
+DATING,,,,,,"ack data
+----
+READY","retry - 1
+set cmd timer
+data
+----","----
+READY"

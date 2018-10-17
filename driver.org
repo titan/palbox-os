@@ -424,7 +424,7 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
   static void uart3_ping() {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = ALL;
+    packet.devtype = ALL;
     packet.devid = 0xFF;
     packet.payload.all.online = network_is_online();
     populate_uart3_packet_to_tx(&packet, &tx);
@@ -439,14 +439,14 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
   #include "egg_payload.h"
   #include "uart3_payload.h"
 
-  typedef enum UART3_DEV_TYPE {
+  typedef enum UART3_DEVTYPE {
     CARD_READER = 0x10,
     EGG = 0x20,
     ALL = 0xF0,
-  } uart3_dev_type_t;
+  } uart3_devtype_t;
 
   typedef struct {
-    uart3_dev_type_t dev_type;
+    uart3_devtype_t devtype;
     uint8_t devid;
     union {
       card_payload_t card_reader;
@@ -458,7 +458,7 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
   uint32_t uart3_packet_calculate_encode_size(uart3_packet_t * packet);
   uint32_t uart3_packet_encode(uart3_packet_t * packet, uint8_t * buf, uint32_t size);
   uint32_t uart3_packet_estimate_decode_size(uint8_t * buf, uint8_t size);
-  uart3_dev_type_t uart3_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart3_packet_t * packet);
+  uart3_devtype_t uart3_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart3_packet_t * packet);
 
   #define _populate_uart3_packet_to_tx_1(packet, tx, line) do {           \
       uint32_t elen##line = uart3_packet_calculate_encode_size(packet);   \
@@ -545,7 +545,7 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
   #define UART3_PACKET_META_SIZE (2 + 4 + 1 + 1) // magic number + checksum + type and id + length
 
   uint32_t uart3_packet_calculate_encode_size(uart3_packet_t * packet) {
-    switch (packet->dev_type) {
+    switch (packet->devtype) {
     case CARD_READER:
       return card_payload_calculate_size(&packet->payload.card_reader) + UART3_PACKET_META_SIZE;
     case EGG:
@@ -562,9 +562,9 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
 
     buf[0] = 0xA5;
     buf[1] = 0x5A;
-    buf[6] = (packet->dev_type | packet->devid) | 0x80 /* from epigyny to hypogyny*/;
+    buf[6] = (packet->devtype | packet->devid) | 0x80 /* from epigyny to hypogyny*/;
 
-    switch (packet->dev_type) {
+    switch (packet->devtype) {
     case CARD_READER:
       buf[7] = card_payload_encode_zeropack(&packet->payload.card_reader, buf + UART3_PACKET_META_SIZE, size - UART3_PACKET_META_SIZE);
       break;
@@ -614,7 +614,7 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
     return 0;
   }
 
-  uart3_dev_type_t uart3_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart3_packet_t * packet) {
+  uart3_devtype_t uart3_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart3_packet_t * packet) {
 
     if (size <= UART3_PACKET_META_SIZE) return 0;
     if (buf[0] != 0xA5 || buf[1] != 0x5A) {
@@ -627,10 +627,10 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
         (buf[3] == ((checksum >> 8) & 0xFF)) &&
         (buf[4] == ((checksum >> 16) & 0xFF)) &&
         (buf[5] == ((checksum >> 24) & 0xFF))) {
-      packet->dev_type = buf[6] & 0xF0;
+      packet->devtype = buf[6] & 0xF0;
       packet->devid = buf[6] & 0x0F;
       uint8_t tmp[estimated];
-      switch (packet->dev_type) {
+      switch (packet->devtype) {
       case CARD_READER:
         card_payload_decode_zeropack(buf + UART3_PACKET_META_SIZE, size - UART3_PACKET_META_SIZE, tmp, &packet->payload.card_reader);
         return CARD_READER;
@@ -656,7 +656,8 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
 #+end_src
 
 *** UART4
-UART4 总线上运行的是锁控和充电检测。
+UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自有封包格式，
+充电检测和 RFID 采用统一的封包格式。
 ***** 基本框架
 #+begin_src c :tangle /dev/shm/boxos/uart4.h
   #ifndef __UART4_H
@@ -680,25 +681,18 @@ UART4 总线上运行的是锁控和充电检测。
   #include "lock.h"
   #ifndef ENGINEER_MODE
   #include "charger.h"
+  #include "rfid-reader.h"
   #endif
   #include "console.h"
+
+  <<uart4-context>>
 
   #define UART4_TX_BUFFER_SIZE 10
   #define UART4_RX_BUFFER_SIZE 8
   static struct ring_t tx, rx;
   static uint8_t tx_buffer[2 << (UART4_TX_BUFFER_SIZE - 1)], rx_buffer[2 << (UART4_RX_BUFFER_SIZE - 1)];
 
-  struct uart4_context_t {
-    uint8_t buf[512];
-    uint16_t ptr;
-    uint8_t byte;
-    uint8_t len0;
-    uint8_t len1;
-    uint32_t countdown;
-    uint32_t rx_timer;
-  };
-
-  static uint32_t uart4_state = UART4_INITIAL_STATE;
+  static uint32_t uart4_state = UART4_READY_STATE;
   static struct uart4_context_t context;
 
   <<uart4-setup>>
@@ -711,6 +705,7 @@ UART4 总线上运行的是锁控和充电检测。
   }
 
   <<uart4-mainloop>>
+  <<uart4-callback>>
   <<uart4-fsm>>
 #+end_src
 ***** 配置
@@ -739,6 +734,7 @@ UART4 总线上运行的是锁控和充电检测。
     lock_setup(ctx->tx, ctx->rx);
   #ifndef ENGINEER_MODE
     charger_setup(ctx->tx, ctx->rx);
+    rfid_reader_setup(ctx->tx, ctx->rx);
   #endif
   }
 #+end_src
@@ -748,6 +744,7 @@ UART4 总线上运行的是锁控和充电检测。
     lock_eventloop();
   #ifndef ENGINEER_MODE
     charger_eventloop();
+    rfid_reader_eventloop();
   #endif
     struct uart4_context_t * pctx = &context;
     uint32_t rxlen = ring_length(ctx->rx);
@@ -771,34 +768,20 @@ UART4 总线上运行的是锁控和充电检测。
           uart4_state = uart4_transform_state(uart4_state, UART4_0X03_MINUS_0X08_EVENT, pctx);
         } else if (0x09 <= byte && byte <= 0x14) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0X09_MINUS_0X14_EVENT, pctx);
-        } else if (0x15 <= byte && byte <= 0x32) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0X15_MINUS_0X32_EVENT, pctx);
         } else if (byte == 0x33) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0X33_EVENT, pctx);
-        } else if (0x34 <= byte && byte <= 0x3B) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0X34_MINUS_0X3B_EVENT, pctx);
         } else if (byte == 0x3C) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0X3C_EVENT, pctx);
-        } else if (0x3D <= byte && byte <= 0x54) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0X3D_MINUS_0X54_EVENT, pctx);
         } else if (byte == 0x55) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0X55_EVENT, pctx);
-        } else if (0x56 <= byte && byte <= 0xA9) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0X56_MINUS_0XA9_EVENT, pctx);
         } else if (byte == 0xAA) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0XAA_EVENT, pctx);
-        } else if (0xAB <= byte && byte <= 0xC2) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0XAB_MINUS_0XC2_EVENT, pctx);
         } else if (byte == 0xC3) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0XC3_EVENT, pctx);
-        } else if (0xC4 <= byte && byte <= 0xCB) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0XC4_MINUS_0XCB_EVENT, pctx);
         } else if (byte == 0xCC) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0XCC_EVENT, pctx);
-        } else if (0xCD <= byte && byte <= 0xFE) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0XCD_MINUS_0XFE_EVENT, pctx);
         } else if (byte == 0xFF) {
-          uart4_state = uart4_transform_state(uart4_state, UART4_0XFF_EVENT, pctx);
+          uart4_state = uart4_transform_state(uart4_state, UART4_OTHER_EVENT, pctx);
         }
         if (pctx->countdown == 0) {
           uart4_state = uart4_transform_state(uart4_state, UART4_COUNTDOWN_EQUALS_0_EVENT, pctx);
@@ -813,6 +796,19 @@ UART4 总线上运行的是锁控和充电检测。
   }
 #+end_src
 ***** 协议状态机
+****** 解析上下文
+#+begin_src c :noweb-ref uart4-context
+  struct uart4_context_t {
+    uint8_t buf[512];
+    uint16_t ptr;
+    uint8_t byte;
+    uint8_t len0;
+    uint8_t len1;
+    uint32_t countdown;
+    uint32_t rx_timer;
+  };
+#+end_src
+****** 执行动作
 #+begin_src c :noweb-ref uart4-fsm
   void uart4_do_action(enum UART4_ACTION action, void * data) {
     struct uart4_context_t * pctx = (struct uart4_context_t *) data;
@@ -820,22 +816,21 @@ UART4 总线上运行的是锁控和充电检测。
     case UART4_APPEND_ACTION:
       pctx->buf[pctx->ptr ++] = pctx->byte;
       break;
-    case UART4_CLEAR_ACTION:
+    case UART4_RESET_ACTION:
       bzero(pctx, sizeof(struct uart4_context_t));
       pctx->countdown = (uint32_t) 0xFFFFFFFFFF;
       break;
-    case UART4_APPEND_AND_SAVE_LEN_PLUS_1_ACTION:
+    case UART4_APPEND_AND_SET_LEN_PLUS_1_ACTION:
       pctx->buf[pctx->ptr ++] = pctx->byte;
       pctx->countdown = pctx->byte + 1; // include crc8
       break;
-    case UART4_APPEND_AND_SAVE_LEN0_ACTION:
+    case UART4_APPEND_AND_SET_LEN0_ACTION:
       pctx->buf[pctx->ptr ++] = pctx->byte;
       pctx->len0 = pctx->byte;
       break;
-    case UART4_APPEND_AND_SAVE_LEN1_ACTION:
+    case UART4_APPEND_AND_SET_COUNTDOWN_ACTION:
       pctx->buf[pctx->ptr ++] = pctx->byte;
-      pctx->len1 = pctx->byte;
-      pctx->countdown = ((pctx->len1 << 8) | pctx->len0) & 0xFFFF;
+      pctx->countdown = ((pctx->byte << 8) | pctx->len0) & 0xFFFF;
       break;
     case UART4_LOCK_DGZL_CALLBACK_ACTION:
       lock_callback(pctx->buf, pctx->ptr);
@@ -847,16 +842,294 @@ UART4 总线上运行的是锁控和充电检测。
       bzero(pctx, sizeof(struct uart4_context_t));
       pctx->countdown = (uint32_t) 0xFFFFFFFFFF;
       break;
-    case UART4_CHARGER_CALLBACK_ACTION:
+    case UART4_UART4_CALLBACK_ACTION: {
   #ifndef ENGINEER_MODE
-      charger_callback(pctx->buf, pctx->ptr);
+      uart4_callback(pctx->buf, pctx->ptr);
   #endif
       bzero(pctx, sizeof(struct uart4_context_t));
       pctx->countdown = (uint32_t) 0xFFFFFFFFFF;
       break;
     }
+    }
   }
 #+end_src
+***** 协议回调
+#+begin_src c :noweb-ref uart4-callback
+  static void uart4_callback(uint8_t * buf, uint32_t size) {
+    uint32_t estimated = uart4_packet_estimate_decode_size(buf, size);
+    uint8_t tmp[estimated];
+    bzero(tmp, estimated);
+    uart4_packet_t * packet = (uart4_packet_t *) tmp;
+    switch (uart4_packet_decode(buf, size, estimated, packet)) {
+    case CHARGER:
+      charger_callback(packet);
+      break;
+    case RFID_READER:
+      rfid_reader_callback(packet);
+      break;
+    default:
+      break;
+    }
+  }
+#+end_src
+***** 协议封包
+#+begin_src c :tangle /dev/shm/boxos/uart4-packet.h
+  #ifndef __UART4_PACKET_H
+  #define __UART4_PACKET_H
+  #include <stdint.h>
+  #include "charger_payload.h"
+  #include "rfid_payload.h"
+
+  typedef enum UART4_DEV_TYPE {
+    CHARGER = 0x00,
+    RFID_READER = 0x10,
+    ALL = 0xF0,
+  } uart4_dev_type_t;
+
+  typedef struct {
+    uart4_dev_type_t devtype;
+    uint8_t devid;
+    uint8_t version;
+    union {
+      charger_payload_t charger;
+      rfid_payload_t rfid_reader;
+    } payload;
+  } uart4_packet_t;
+
+  uint32_t uart4_packet_calculate_encode_size(uart4_packet_t * packet);
+  uint32_t uart4_packet_encode(uart4_packet_t * packet, uint8_t * buf, uint32_t size);
+  uint32_t uart4_packet_estimate_decode_size(uint8_t * buf, uint8_t size);
+  uart4_dev_type_t uart4_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart4_packet_t * packet);
+
+  #define _populate_uart4_packet_to_tx_1(packet, tx, line) do {           \
+      uint32_t elen##line = uart4_packet_calculate_encode_size(packet);   \
+      uint8_t ebuf##line[elen##line];                                     \
+      uint8_t size_of_len##line = 0;                                      \
+      if (elen##line < 128) {                                             \
+        size_of_len##line = 1;                                            \
+      } else if (elen##line < 16384) {                                    \
+        size_of_len##line = 2;                                            \
+      } else if (elen##line < 2097152) {                                  \
+        size_of_len##line = 3;                                            \
+      } else {                                                            \
+        size_of_len##line = 4;                                            \
+      }                                                                   \
+      if (ring_available(tx) >= elen##line + size_of_len##line) {         \
+        bzero(ebuf##line, elen##line);                                    \
+        uint32_t len##line = uart4_packet_encode(packet, ebuf##line, elen##line); \
+        elen##line = len##line;                                           \
+        while (elen##line > 0) {                                          \
+          ring_write(tx, elen##line & 0x7F);                              \
+          elen##line = elen##line >> 7;                                   \
+        }                                                                 \
+        ring_write_array(tx, ebuf##line, 0, len##line);                   \
+      }                                                                   \
+    } while (0)
+
+  #define _populate_uart4_packet_to_tx_0(packet, tx, line) _populate_uart4_packet_to_tx_1(packet, tx, line)
+
+  #define populate_uart4_packet_to_tx(packet, tx) _populate_uart4_packet_to_tx_0(packet, tx, __LINE__)
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/boxos/uart4-packet.c
+  #include "uart4-packet.h"
+  #include "hash.h"
+  #include "base64.h"
+
+  /*
+    packet layout:
+
+            +-+-+-+-+-+-+-+-+
+    byte 0  |1|1|0|0|1|1|0|0|   magic number 0
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 1  |1|1|0|0|0|0|1|1|   magic number 1
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 2  |0|0|1|1|1|1|0|0|   magic number 2
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 3  |0|0|1|1|0|0|1|1|   magic number 3
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 4  |x|x|x|x|x|x|x|x|   adle32-0 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 5  |x|x|x|x|x|x|x|x|   adle32-1 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 6  |x|x|x|x|x|x|x|x|   adle32-2 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 7  |x|x|x|x|x|x|x|x|   adle32-3 of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 8  |x|x|x|x|x|x|x|x|   type (4 bit) and id (4 bit)
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte 9  |0|0|0|0|0|0|0|0|   version
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte A  |x|x|x|x|x|x|x|x|   lsb of length of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte B  |x|x|x|x|x|x|x|x|   msb of length of data
+            +-+-+-+-+-+-+-+-+
+
+            +-+-+-+-+-+-+-+-+
+    byte C  |x|x|x|x|x|x|x|x|   begin of data
+            +-+-+-+-+-+-+-+-+
+                    .
+                    .
+                    .
+            +-+-+-+-+-+-+-+-+
+    byte n  |x|x|x|x|x|x|x|x|   end of data
+            +-+-+-+-+-+-+-+-+
+
+  ,*/
+
+
+  #define UART4_PACKET_META_SIZE (4 + 4 + 1 + 1 + 2) // magic number + checksum + type and id + ver + length
+
+  uint32_t uart4_packet_calculate_encode_size(uart4_packet_t * packet) {
+    switch (packet->devtype) {
+    case CHARGER:
+      return base64_encode_length(charger_payload_calculate_size(&packet->payload.charger)) + UART4_PACKET_META_SIZE;
+    case RFID_READER:
+      return base64_encode_length(rfid_payload_calculate_size(&packet->payload.rfid_reader)) + UART4_PACKET_META_SIZE;
+    default:
+      return 0;
+    }
+  }
+
+
+  uint32_t uart4_packet_encode(uart4_packet_t * packet, uint8_t * buf, uint32_t size) {
+
+    buf[0] = 0xCC;
+    buf[1] = 0xC3;
+    buf[2] = 0x3C;
+    buf[3] = 0x33;
+    buf[8] = (packet->devtype | packet->devid);
+    buf[9] = packet->version;
+
+    uint32_t base64len = 0;
+
+    switch (packet->devtype) {
+    case RFID_READER: {
+      uint8_t zbuf[size];
+      uint32_t zsize = rfid_payload_encode_zeropack(&packet->payload.rfid_reader, zbuf, size);
+      base64len = base64_encode(zbuf, zsize, buf + UART4_PACKET_META_SIZE, size - UART4_PACKET_META_SIZE);
+      break;
+    }
+    case CHARGER: {
+      uint8_t zbuf[size];
+      uint32_t zsize = charger_payload_encode_zeropack(&packet->payload.charger, zbuf, size);
+      base64len = base64_encode(zbuf, zsize, buf + UART4_PACKET_META_SIZE, size - UART4_PACKET_META_SIZE);
+      break;
+    }
+    default:
+      break;
+    }
+
+    buf[10] = base64len & 0xFF;
+    buf[11] = (base64len >> 8) & 0xFF;
+
+    uint32_t checksum = adler32(buf + UART4_PACKET_META_SIZE, base64len + 4 /* id + ver + len */);
+    buf[2] = checksum & 0xFF;
+    buf[3] = (checksum >> 8) & 0xFF;
+    buf[4] = (checksum >> 16) & 0xFF;
+    buf[5] = (checksum >> 24) & 0xFF;
+
+    return base64len + UART4_PACKET_META_SIZE;
+  }
+
+  uint32_t uart4_packet_estimate_decode_size(uint8_t * buf, uint8_t size) {
+    if (size <= UART4_PACKET_META_SIZE) return 0;
+    if (buf[0] != 0xCC ||
+        buf[1] != 0xC3 ||
+        buf[2] != 0x3C ||
+        buf[3] != 0x33) {
+      return 0;
+    }
+    uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
+    uint32_t checksum = adler32(buf + UART4_PACKET_META_SIZE, len + 4);
+    if ((buf[4] == (checksum & 0xFF)) &&
+        (buf[5] == ((checksum >> 8) & 0xFF)) &&
+        (buf[6] == ((checksum >> 16) & 0xFF)) &&
+        (buf[7] == ((checksum >> 24) & 0xFF))) {
+      switch (buf[8] & 0xF0) {
+      case RFID_READER: {
+        uint32_t zlen = base64_decode_length(buf + UART4_PACKET_META_SIZE, len);
+        if (zlen == 0) return 0;
+        uint8_t zbuf[zlen];
+        base64_decode(buf + UART4_PACKET_META_SIZE, len, zbuf, zlen);
+        return rfid_payload_estimate_zeropack_size(zbuf, zlen) + UART4_PACKET_META_SIZE;
+      }
+      case CHARGER: {
+        uint32_t zlen = base64_decode_length(buf + UART4_PACKET_META_SIZE, len);
+        if (zlen == 0) return 0;
+        uint8_t zbuf[zlen];
+        base64_decode(buf + UART4_PACKET_META_SIZE, len, zbuf, zlen);
+        return charger_payload_estimate_zeropack_size(zbuf, zlen) + UART4_PACKET_META_SIZE;
+      }
+      default:
+        return 0;
+      }
+    }
+    return 0;
+  }
+
+  uart4_dev_type_t uart4_packet_decode(uint8_t * buf, uint8_t size, uint8_t estimated, uart4_packet_t * packet) {
+    if (size < UART4_PACKET_META_SIZE) return 0;
+    if (buf[0] != 0xCC ||
+        buf[1] != 0xC3 ||
+        buf[2] != 0x3C ||
+        buf[3] != 0x33) {
+      return 0;
+    }
+    uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
+    uint32_t checksum = adler32(buf + 8, len + 4);
+    if ((buf[4] == (checksum & 0xFF)) &&
+        (buf[5] == ((checksum >> 8) & 0xFF)) &&
+        (buf[6] == ((checksum >> 16) & 0xFF)) &&
+        (buf[7] == ((checksum >> 24) & 0xFF))) {
+      uint32_t zlen = base64_decode_length(buf + UART4_PACKET_META_SIZE - 1, len);
+      if (zlen == 0) return 0;
+      uint8_t zbuf[zlen];
+      zlen = base64_decode(buf + UART4_PACKET_META_SIZE, len, zbuf, zlen);
+      packet->version = buf[9];
+      packet->devtype = buf[8] & 0xF0;
+      packet->devid = buf[8] & 0x0F;
+      switch (buf[8] & 0xF0) {
+      case RFID_READER: {
+        uint8_t dbuf[estimated];
+        rfid_payload_decode_zeropack(zbuf, zlen, dbuf, &packet->payload.rfid_reader);
+        return RFID_READER;
+      }
+      case CHARGER: {
+        uint8_t dbuf[estimated];
+        charger_payload_decode_zeropack(zbuf, zlen, dbuf, &packet->payload.charger);
+        return CHARGER;
+      }
+      default:
+        return ALL; // for error
+      }
+    }
+    return ALL; // for error
+  }
+#+end_src
+
 ** LED
 #+begin_src c :tangle /dev/shm/boxos/led.h
   #ifndef _LED_H

@@ -671,6 +671,9 @@
     EGG_VOLUME = 0x1F,
     EGG_TIMEOUT = 0x20,
     EGG_QUERY = 0x21,
+    RFID_READER_INVENTORY = 0x21,
+    RFID_READER_DIFFERENCE = 0x21,
+    RFID_READER_DATA = 0x21,
   } cmd_type_t;
 
   typedef struct {

@@ -280,7 +280,7 @@
   static void lock_on(uint8_t egg, uint8_t cabin, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_LOCK_ON;
@@ -322,7 +322,7 @@
   static void lock_off(uint8_t egg, uint8_t cabin, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_LOCK_OFF;
@@ -364,7 +364,7 @@
   static void play(uint8_t egg, uint16_t audio, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_PLAY;
@@ -406,7 +406,7 @@
   static void volume(uint8_t egg, uint8_t volume, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_VOLUME;
@@ -448,7 +448,7 @@
   static void gpio(uint8_t egg, uint8_t gpio, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_GPIO;
@@ -490,7 +490,7 @@
   static void query(uint8_t egg, uint8_t cabin, uint16_t pin) {
     uart3_packet_t packet;
     bzero(&packet, sizeof(uart3_packet_t));
-    packet.dev_type = EGG;
+    packet.devtype = EGG;
     packet.devid = egg;
     packet.payload.egg.sn = pin;
     packet.payload.egg.cmd = EGG_QUERY;
