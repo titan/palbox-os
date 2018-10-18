@@ -161,9 +161,10 @@
   void rfid_reader_do_action(enum RFID_READER_ACTION action, void * data) {
     uint8_t idx = * (uint8_t *) data;
     switch (action) {
-    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
+    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
       ctxs[idx].retry = 10;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      activated |= 1 << idx;
       inventory(idx + 1, ctxs[idx].door, ctxs[idx].pin);
       parameter_t confirm;
       bzero(&confirm, sizeof(parameter_t));
@@ -171,7 +172,7 @@
       confirm.cmd_type = RFID_READER_INVENTORY;
       confirm.pin = ctxs[idx].pin;
       confirm.board = idx + 1;
-      confirm.door = ctxs[idx].door;
+      confirm.lock= ctxs[idx].door;
       confirm.rssi = network_rssi;
       confirm.ber = network_ber;
       confirm.network_reset = (int) network_reset_times;
@@ -193,7 +194,7 @@
       uint8_t ebuf[confirm_size];
       uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
       network_write(ebuf, bufsize);
-      console_log("Confirm RFID-READER-INVENTORY (");
+      console_log("Confirm RFID-READER-INVENTORY(board: ");
       console_number(idx + 1);
       console_string(", door: ");
       console_number(ctxs[idx].door);
@@ -202,9 +203,10 @@
       console_string(")\r\n");
       break;
     }
-    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
+    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
       ctxs[idx].retry = 10;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      activated |= 1 << idx;
       difference(idx + 1, ctxs[idx].door, ctxs[idx].pin);
       parameter_t confirm;
       bzero(&confirm, sizeof(parameter_t));
@@ -212,7 +214,7 @@
       confirm.cmd_type = RFID_READER_DIFFERENCE;
       confirm.pin = ctxs[idx].pin;
       confirm.board = idx + 1;
-      confirm.door = ctxs[idx].door;
+      confirm.lock = ctxs[idx].door;
       confirm.rssi = network_rssi;
       confirm.ber = network_ber;
       confirm.network_reset = (int) network_reset_times;
@@ -234,7 +236,7 @@
       uint8_t ebuf[confirm_size];
       uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
       network_write(ebuf, bufsize);
-      console_log("Confirm RFID-READER-INVENTORY (");
+      console_log("Confirm RFID-READER-DIFFERENCE(board: ");
       console_number(idx + 1);
       console_string(", door: ");
       console_number(ctxs[idx].door);
@@ -243,9 +245,10 @@
       console_string(")\r\n");
       break;
     }
-    case RFID_READER_SET_RETRY_EQUALS_3_NEWLINE_SET_CMD_TIMER_NEWLINE_DATA_ACTION:
+    case RFID_READER_SET_RETRY_EQUALS_3_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DATA_ACTION:
       ctxs[idx].retry = 3;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      activated |= 1 << idx;
       fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
       break;
     case RFID_READER_INVENTORY_RESULT_ACTION:
@@ -290,7 +293,7 @@
       uint8_t ebuf[confirm_size];
       uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
       network_write(ebuf, bufsize);
-      console_log("Confirm RFID-READER-DATA (");
+      console_log("Confirm RFID-READER-DATA(board: ");
       console_number(idx + 1);
       console_string(", pin: ");
       console_number(ctxs[idx].pin);
@@ -302,13 +305,16 @@
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
       break;
+    case RFID_READER_SET_UNACTIVATED_ACTION:
+      activated &= ~(1 << idx);
+      break;
     }
   }
 #+end_src
 ** 对外接口
 *** 盘库
 #+begin_src c :noweb-ref inventory-prototype
-  void rfid_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin);
 #+end_src
 #+begin_src c :noweb-ref inventory
   static void inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
@@ -323,7 +329,7 @@
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
 
-  void rfid_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
@@ -332,7 +338,7 @@
 #+end_src
 *** 差集
 #+begin_src c :noweb-ref difference-prototype
-  void rfid_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin);
 #+end_src
 #+begin_src c :noweb-ref difference
   static void difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
@@ -347,7 +353,7 @@
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
 
-  void rfid_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
@@ -356,7 +362,7 @@
 #+end_src
 *** 获取数据
 #+begin_src c :noweb-ref fetch-data-prototype
-  void rfid_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin);
+  void rfid_reader_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin);
 #+end_src
 #+begin_src c :noweb-ref fetch-data
   static void fetch_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
@@ -373,7 +379,7 @@
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
 
-  void rfid_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
+  void rfid_reader_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].scope = scope;

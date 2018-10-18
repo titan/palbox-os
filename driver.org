@@ -1045,11 +1045,11 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
     buf[10] = base64len & 0xFF;
     buf[11] = (base64len >> 8) & 0xFF;
 
-    uint32_t checksum = adler32(buf + UART4_PACKET_META_SIZE, base64len + 4 /* id + ver + len */);
-    buf[2] = checksum & 0xFF;
-    buf[3] = (checksum >> 8) & 0xFF;
-    buf[4] = (checksum >> 16) & 0xFF;
-    buf[5] = (checksum >> 24) & 0xFF;
+    uint32_t checksum = adler32(buf + 4 + 4 /* magic + checksum */, base64len + 4 /* id + ver + len */);
+    buf[4] = checksum & 0xFF;
+    buf[5] = (checksum >> 8) & 0xFF;
+    buf[6] = (checksum >> 16) & 0xFF;
+    buf[7] = (checksum >> 24) & 0xFF;
 
     return base64len + UART4_PACKET_META_SIZE;
   }
@@ -1063,7 +1063,7 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
       return 0;
     }
     uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
-    uint32_t checksum = adler32(buf + UART4_PACKET_META_SIZE, len + 4);
+    uint32_t checksum = adler32(buf + 4 + 4 /* magic + checksum */, len + 4 /* id + ver + len */);
     if ((buf[4] == (checksum & 0xFF)) &&
         (buf[5] == ((checksum >> 8) & 0xFF)) &&
         (buf[6] == ((checksum >> 16) & 0xFF)) &&
@@ -1099,12 +1099,12 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
       return 0;
     }
     uint32_t len = (buf[10] + (buf[11] << 8)) & 0xFFFF;
-    uint32_t checksum = adler32(buf + 8, len + 4);
+    uint32_t checksum = adler32(buf + 4 + 4 /* magic + checksum */, len + 4 /* id + ver + len */);
     if ((buf[4] == (checksum & 0xFF)) &&
         (buf[5] == ((checksum >> 8) & 0xFF)) &&
         (buf[6] == ((checksum >> 16) & 0xFF)) &&
         (buf[7] == ((checksum >> 24) & 0xFF))) {
-      uint32_t zlen = base64_decode_length(buf + UART4_PACKET_META_SIZE - 1, len);
+      uint32_t zlen = base64_decode_length(buf + UART4_PACKET_META_SIZE, len);
       if (zlen == 0) return 0;
       uint8_t zbuf[zlen];
       zlen = base64_decode(buf + UART4_PACKET_META_SIZE, len, zbuf, zlen);
