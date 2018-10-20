@@ -87,7 +87,7 @@
       console_number(payload->door);
       console_newline();
       parameter_t param;
-      bzero(&param, sizeof(parameter_t));
+      init_parameter(&param);
       param.sn = sn ++;
       param.card_no = payload->card;
       param.lock = payload->door;
@@ -95,26 +95,6 @@
       param.card_reader = payload->reader_id;
       param.pin = ((payload->reader_id << 12) | timestamp) & 0xFFFF;
       param.timestamp = timestamp;
-      param.rssi = network_rssi;
-      param.ber = network_ber;
-      param.reply_time = network_reply_time;
-      param.ttl = network_ttl;
-      param.network_reset = (int) network_reset_times;
-      param.network_shutdown = (int) network_shutdown_times;
-      param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-      param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-      param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-      param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-      param.fireware_version |= (1 << (1 + 16));
-  #endif
-
       uint8_t param_size = packet_calculate_encode_size(&param);
       uint8_t upbuf[param_size];
       uint8_t bufsize = packet_encode(LOCK_OFF, uid, &param, upbuf, param_size);
@@ -291,31 +271,12 @@
 
   void card_reader_confirm_play(uint8_t card_reader, uint16_t audio, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = PLAY;
     param.card_reader = card_reader;
     param.audio = (int16_t) audio;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -338,31 +299,12 @@
 
   void card_reader_confirm_volume(uint8_t card_reader, uint8_t volume, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = VOLUME;
     param.card_reader = card_reader;
     param.volume = (int8_t) volume;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);

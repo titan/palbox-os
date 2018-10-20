@@ -164,7 +164,7 @@
       }
       ctxs[idx].timer = systick + ctxs[idx].interval;
       parameter_t confirm;
-      bzero(&confirm, sizeof(parameter_t));
+      init_parameter(&confirm);
       confirm.sn = sn ++;
       confirm.pin = ctxs[idx].pin;
       confirm.cmd_type = ctxs[idx].cmd;
@@ -188,12 +188,6 @@
         confirm.busy = ctxs[idx].busy;
         break;
       }
-      confirm.rssi = network_rssi;
-      confirm.ber = network_ber;
-      confirm.reply_time = network_reply_time;
-      confirm.ttl = network_ttl;
-      confirm.network_reset = (int) network_reset_times;
-      confirm.network_shutdown = (int) network_shutdown_times;
       uint8_t confirm_size = packet_calculate_encode_size(&confirm);
       uint8_t buf[confirm_size];
       uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
@@ -247,19 +241,12 @@
     case EGG_TIMEOUT:
     case EGG_FALLEN: {
       parameter_t param;
-      bzero(&param, sizeof(parameter_t));
+      init_parameter(&param);
       param.sn = sn ++;
       param.lock = payload->cabin;
       param.board = egg;
       param.pin = ((egg << 12) | timestamp) & 0xFFFF;
       param.timestamp = timestamp;
-      param.rssi = network_rssi;
-      param.ber = network_ber;
-      param.reply_time = network_reply_time;
-      param.ttl = network_ttl;
-      param.network_reset = (int) network_reset_times;
-      param.network_shutdown = (int) network_shutdown_times;
-
       uint8_t param_size = packet_calculate_encode_size(&param);
       uint8_t upbuf[param_size];
       uint8_t bufsize = packet_encode(payload->cmd, uid, &param, upbuf, param_size);

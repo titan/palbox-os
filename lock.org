@@ -247,32 +247,13 @@
       break;
     case LOCKBOARD_REPORT_NEWLINE_LOCK_STATUS_ACTION: {
       parameter_t param;
-      bzero(&param, sizeof(parameter_t));
+      init_parameter(&param);
       param.sn = sn ++;
       param.board = idx + 1;
       param.states = bctxs[idx].status;
       param.__states_len = 3;
       param.timestamp = timestamp + 10 * 60 * 1000; // valid in 10 minutes
-      param.rssi = network_rssi;
-      param.ber = network_ber;
-      param.reply_time = network_reply_time;
-      param.ttl = network_ttl;
-      param.network_reset = (int) network_reset_times;
-      param.network_shutdown = (int) network_shutdown_times;
       param.pin = lock_generate_pin(idx + 1, idx + 1, timestamp);
-      param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-      param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-      param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-      param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-      param.fireware_version |= (1 << (1 + 16));
-  #endif
       uint8_t param_size = packet_calculate_encode_size(&param);
       uint8_t upbuf[param_size];
       uint8_t bufsize = packet_encode(LOCK_DATA, uid, &param, upbuf, param_size);
@@ -291,31 +272,12 @@
     case LOCK_CONFIRM_LOCK_OFF_ACTION:
     case LOCK_CONFIRM_LOCK_OFF_NEWLINE_RETRY_EQUALS_2_NEWLINE_LOCK_OFF_FIRST_NEWLINE_SET_REMAINING_ACTION: {
       parameter_t confirm;
-      bzero(&confirm, sizeof(parameter_t));
+      init_parameter(&confirm);
       if (tasks[idx].locks_count > 1) {
         confirm.pin = tasks[idx].pin;
         confirm.sn = sn ++;
         confirm.cmd_type = LOCKS_OFF;
         confirm.board = tasks[idx].board + 1;
-        confirm.rssi = network_rssi;
-        confirm.ber = network_ber;
-        confirm.reply_time = network_reply_time;
-        confirm.ttl = network_ttl;
-        confirm.network_reset = (int) network_reset_times;
-        confirm.network_shutdown = (int) network_shutdown_times;
-        confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-        confirm.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-        confirm.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-        confirm.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-        confirm.fireware_version |= (1 << (1 + 16));
-  #endif
         uint8_t confirm_size = packet_calculate_encode_size(&confirm);
         uint8_t buf[confirm_size];
         uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);
@@ -342,25 +304,6 @@
         confirm.cmd_type = LOCK_OFF;
         confirm.board = tasks[idx].board + 1;
         confirm.lock = lock;
-        confirm.rssi = network_rssi;
-        confirm.ber = network_ber;
-        confirm.reply_time = network_reply_time;
-        confirm.ttl = network_ttl;
-        confirm.network_reset = (int) network_reset_times;
-        confirm.network_shutdown = (int) network_shutdown_times;
-        confirm.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-        confirm.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-        confirm.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-        confirm.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-        confirm.fireware_version |= (1 << (1 + 16));
-  #endif
         uint8_t confirm_size = packet_calculate_encode_size(&confirm);
         uint8_t buf[confirm_size];
         uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, buf, confirm_size);

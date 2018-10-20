@@ -208,6 +208,12 @@
       /* Retrieve the data from the peripheral. */
       data = usart_recv(UART[idx]);
       ring_write(ctx->rx, data);
+      /*
+      if (idx == 3) {
+        console_byte(data);
+        console_char(' ');
+      }
+      */
       if (ring_available(ctx->rx) == 0) {
         /* Disable the RXNEIE interrupt */
         USART_CR1(UART[idx]) &= ~USART_CR1_RXNEIE;
@@ -780,7 +786,7 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
           uart4_state = uart4_transform_state(uart4_state, UART4_0XC3_EVENT, pctx);
         } else if (byte == 0xCC) {
           uart4_state = uart4_transform_state(uart4_state, UART4_0XCC_EVENT, pctx);
-        } else if (byte == 0xFF) {
+        } else {
           uart4_state = uart4_transform_state(uart4_state, UART4_OTHER_EVENT, pctx);
         }
         if (pctx->countdown == 0) {
@@ -831,6 +837,9 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
     case UART4_APPEND_AND_SET_COUNTDOWN_ACTION:
       pctx->buf[pctx->ptr ++] = pctx->byte;
       pctx->countdown = ((pctx->byte << 8) | pctx->len0) & 0xFFFF;
+      if (pctx->countdown + UART4_PACKET_META_SIZE > 512) {
+        pctx->countdown = 512 - UART4_PACKET_META_SIZE;
+      }
       break;
     case UART4_LOCK_DGZL_CALLBACK_ACTION:
       lock_callback(pctx->buf, pctx->ptr);
@@ -879,6 +888,7 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
   #include <stdint.h>
   #include "charger_payload.h"
   #include "rfid_payload.h"
+  #define UART4_PACKET_META_SIZE (4 + 4 + 1 + 1 + 2) // magic number + checksum + type and id + ver + length
 
   typedef enum UART4_DEV_TYPE {
     CHARGER = 0x00,
@@ -1000,7 +1010,6 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
   ,*/
 
 
-  #define UART4_PACKET_META_SIZE (4 + 4 + 1 + 1 + 2) // magic number + checksum + type and id + ver + length
 
   uint32_t uart4_packet_calculate_encode_size(uart4_packet_t * packet) {
     switch (packet->devtype) {
@@ -1202,29 +1211,10 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
   #include "utility.h"
   void light_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = type;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -1275,29 +1265,10 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
   #include "utility.h"
   void ultraviolet_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = type;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -1341,29 +1312,10 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
 
   void camera_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = type;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
@@ -1406,29 +1358,10 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
 
   void fan_confirm(cmd_type_t type, int16_t pin) {
     parameter_t param;
-    bzero(&param, sizeof(parameter_t));
+    init_parameter(&param);
     param.sn = sn ++;
     param.cmd_type = type;
     param.pin = pin;
-    param.rssi = network_rssi;
-    param.ber = network_ber;
-    param.reply_time = network_reply_time;
-    param.ttl = network_ttl;
-    param.network_reset = (int) network_reset_times;
-    param.network_shutdown = (int) network_shutdown_times;
-    param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-    param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-    param.fireware_version |= (1 << (4 + 16));
-  #endif
-  #ifdef EC20
-    param.fireware_version |= (1 << (2 + 16));
-  #endif
-  #ifdef ESP8266
-    param.fireware_version |= (1 << (1 + 16));
-  #endif
     uint8_t param_size = packet_calculate_encode_size(&param);
     uint8_t buf[param_size];
     uint8_t bufsize = packet_encode(CONFIRM, uid, &param, buf, param_size);
