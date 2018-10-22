@@ -129,7 +129,6 @@
     case RFID_READER_INVENTORY_RESPONSE: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].pin = packet->payload.rfid_reader.sn;
       ctxs[idx].num = packet->payload.rfid_reader.len;
       ctxs[idx].scope = RFID_READER_ALL_SCOPE;
       ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_ACK_EVENT, &idx);
@@ -143,7 +142,6 @@
     case RFID_READER_DIFFERENCE_RESPONSE: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].pin = packet->payload.rfid_reader.sn;
       ctxs[idx].scope = RFID_READER_INCREMENT_SCOPE | RFID_READER_DECREMENT_SCOPE;
       ctxs[idx].increment = packet->payload.rfid_reader.increment;
       ctxs[idx].decrement = packet->payload.rfid_reader.decrement;
@@ -160,7 +158,7 @@
     case RFID_READER_DATA_RESPONSE: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].pin = packet->payload.rfid_reader.sn;
+      ctxs[idx].num = packet->payload.rfid_reader.len;
       ctxs[idx].data_len = packet->payload.rfid_reader.__data_len;
       memcpy(ctxs[idx].data, packet->payload.rfid_reader.data, ctxs[idx].data_len);
       ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_EVENT, &idx);
@@ -304,7 +302,10 @@
       confirm.pin = ctxs[idx].pin;
       confirm.scope = ctxs[idx].scope;
       confirm.board = idx + 1;
+      confirm.offset = ctxs[idx].offset;
+      confirm.num = ctxs[idx].num;
       confirm.data = ctxs[idx].data;
+      confirm.__data_len = ctxs[idx].data_len;
       uint8_t confirm_size = packet_calculate_encode_size(&confirm);
       uint8_t ebuf[confirm_size];
       uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
@@ -401,7 +402,7 @@
     ctxs[idx].scope = scope;
     ctxs[idx].offset = offset;
     ctxs[idx].num = num;
-    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_EVENT, &idx);
+    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_EVENT, &idx);
   }
 #+end_src
 ** 通讯协议

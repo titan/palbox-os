@@ -610,7 +610,7 @@
       console_string(", num: ");
       console_number(result->parameter.num);
       console_string(")\r\n");
-      rfid_reader_difference(result->parameter.board, result->parameter.lock, result->parameter.pin);
+      rfid_reader_data(result->parameter.board, result->parameter.scope, result->parameter.offset, result->parameter.num, result->parameter.pin);
       break;
     default:
       break;
