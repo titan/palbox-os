@@ -43,6 +43,7 @@
     uint32_t cmd_timer;
     uint32_t cmd_interval;
     uint32_t retry;
+    uint32_t duration;
     uint16_t pin;
     uint16_t offset;
     uint16_t num;
@@ -201,7 +202,7 @@
       ctxs[idx].retry = 20;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
-      inventory(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      inventory(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       parameter_t confirm;
       init_parameter(&confirm);
       confirm.sn = sn ++;
@@ -226,7 +227,7 @@
       ctxs[idx].retry = 20;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
-      difference(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      difference(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       parameter_t confirm;
       init_parameter(&confirm);
       confirm.sn = sn ++;
@@ -271,7 +272,7 @@
     case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_INVENTORY_ACTION:
       ctxs[idx].retry --;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
-      inventory(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      inventory(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       break;
     case RFID_READER_DIFFERENCE_RESULT_ACTION: {
       parameter_t param;
@@ -292,7 +293,7 @@
     case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_DIFFERENCE_ACTION:
       ctxs[idx].retry --;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
-      difference(idx + 1, ctxs[idx].door, ctxs[idx].pin);
+      difference(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       break;
     case RFID_READER_ACK_DATA_ACTION: {
       parameter_t confirm;
@@ -331,10 +332,10 @@
 ** 对外接口
 *** 盘库
 #+begin_src c :noweb-ref inventory-prototype
-  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin);
 #+end_src
 #+begin_src c :noweb-ref inventory
-  static void inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  static void inventory(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin) {
     uart4_packet_t packet;
     bzero(&packet, sizeof(uart4_packet_t));
     packet.devid = rfid_reader;
@@ -343,22 +344,24 @@
     packet.payload.rfid_reader.sn = pin;
     packet.payload.rfid_reader.cmd = RFID_READER_INVENTORY_REQUEST;
     packet.payload.rfid_reader.door = door;
+    packet.payload.rfid_reader.duration = duration;
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
 
-  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  void rfid_reader_inventory(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin) {
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
+    ctxs[idx].duration = duration;
     ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_EVENT, &idx);
   }
 #+end_src
 *** 差集
 #+begin_src c :noweb-ref difference-prototype
-  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin);
+  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin);
 #+end_src
 #+begin_src c :noweb-ref difference
-  static void difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  static void difference(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin) {
     uart4_packet_t packet;
     bzero(&packet, sizeof(uart4_packet_t));
     packet.devid = rfid_reader;
@@ -367,13 +370,15 @@
     packet.payload.rfid_reader.sn = pin;
     packet.payload.rfid_reader.cmd = RFID_READER_DIFFERENCE_REQUEST;
     packet.payload.rfid_reader.door = door;
+    packet.payload.rfid_reader.duration = duration;
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
 
-  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint16_t pin) {
+  void rfid_reader_difference(uint8_t rfid_reader, uint8_t door, uint32_t duration, uint16_t pin) {
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
+    ctxs[idx].duration = duration;
     ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_EVENT, &idx);
   }
 #+end_src
@@ -465,6 +470,7 @@
       uint8_t cmd;
       int32_t sn;
       uint8_t errno;
+      int32_t duration;
       uint8_t door;
       int16_t len;
       int16_t increment;
@@ -514,7 +520,7 @@
   #include "rfid_payload.h"
   int rfid_payload_calculate_size(rfid_payload_t * rfid_payload) {
     int size = 2;
-    short tags[12];
+    short tags[13];
     int len = 0;
     if (rfid_payload->reader_id != 0) {
       tags[len ++] = 0;
@@ -548,8 +554,16 @@
         size += 2 + 4 + 1;
       }
     }
-    if (rfid_payload->door != 0) {
+    if (rfid_payload->duration != 0) {
       tags[len ++] = 4;
+      if (rfid_payload->duration > 0 && rfid_payload->duration < 16383) {
+        size += 2;
+      } else {
+        size += 2 + 4 + 4;
+      }
+    }
+    if (rfid_payload->door != 0) {
+      tags[len ++] = 5;
       if (rfid_payload->door > 0) {
         size += 2;
       } else {
@@ -557,7 +571,7 @@
       }
     }
     if (rfid_payload->len != 0) {
-      tags[len ++] = 5;
+      tags[len ++] = 6;
       if (rfid_payload->len > 0 && rfid_payload->len < 16383) {
         size += 2;
       } else {
@@ -565,7 +579,7 @@
       }
     }
     if (rfid_payload->increment != 0) {
-      tags[len ++] = 6;
+      tags[len ++] = 7;
       if (rfid_payload->increment > 0 && rfid_payload->increment < 16383) {
         size += 2;
       } else {
@@ -573,7 +587,7 @@
       }
     }
     if (rfid_payload->decrement != 0) {
-      tags[len ++] = 7;
+      tags[len ++] = 8;
       if (rfid_payload->decrement > 0 && rfid_payload->decrement < 16383) {
         size += 2;
       } else {
@@ -581,7 +595,7 @@
       }
     }
     if (rfid_payload->data_scope != 0) {
-      tags[len ++] = 8;
+      tags[len ++] = 9;
       if (rfid_payload->data_scope > 0) {
         size += 2;
       } else {
@@ -589,7 +603,7 @@
       }
     }
     if (rfid_payload->offset != 0) {
-      tags[len ++] = 9;
+      tags[len ++] = 10;
       if (rfid_payload->offset > 0 && rfid_payload->offset < 16383) {
         size += 2;
       } else {
@@ -597,11 +611,11 @@
       }
     }
     if (rfid_payload->data != NULL) {
-      tags[len ++] = 10;
+      tags[len ++] = 11;
       size += 2 + 4 + rfid_payload->__data_len * 1;
     }
     if (rfid_payload->distribution != NULL) {
-      tags[len ++] = 11;
+      tags[len ++] = 12;
       size += 2 + 4 + rfid_payload->__distribution_len * 1;
     }
     if (len > 0) {
@@ -617,7 +631,7 @@
   static int rfid_payload_set__fields(rfid_payload_t * rfid_payload, uint8_t * buf, short * dtags, int * dlen) {
     int ptr = 2;
     short count = 0;
-    for (short tag = 0, nexttag = 0; nexttag < 12; nexttag ++) {
+    for (short tag = 0, nexttag = 0; nexttag < 13; nexttag ++) {
       switch (nexttag) {
       case 0:
         if (rfid_payload->reader_id != 0) {
@@ -688,11 +702,11 @@
         }
       break;
       case 4:
-        if (rfid_payload->door != 0) {
+        if (rfid_payload->duration != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->door > 0) {
-            short t = (short) ((rfid_payload->door + 1) * 2);
+          if (rfid_payload->duration > 0 && rfid_payload->duration < 16383) {
+            short t = (short) ((rfid_payload->duration + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -705,11 +719,11 @@
         }
       break;
       case 5:
-        if (rfid_payload->len != 0) {
+        if (rfid_payload->door != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->len > 0 && rfid_payload->len < 16383) {
-            short t = (short) ((rfid_payload->len + 1) * 2);
+          if (rfid_payload->door > 0) {
+            short t = (short) ((rfid_payload->door + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -722,11 +736,11 @@
         }
       break;
       case 6:
-        if (rfid_payload->increment != 0) {
+        if (rfid_payload->len != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->increment > 0 && rfid_payload->increment < 16383) {
-            short t = (short) ((rfid_payload->increment + 1) * 2);
+          if (rfid_payload->len > 0 && rfid_payload->len < 16383) {
+            short t = (short) ((rfid_payload->len + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -739,11 +753,11 @@
         }
       break;
       case 7:
-        if (rfid_payload->decrement != 0) {
+        if (rfid_payload->increment != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->decrement > 0 && rfid_payload->decrement < 16383) {
-            short t = (short) ((rfid_payload->decrement + 1) * 2);
+          if (rfid_payload->increment > 0 && rfid_payload->increment < 16383) {
+            short t = (short) ((rfid_payload->increment + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -756,11 +770,11 @@
         }
       break;
       case 8:
-        if (rfid_payload->data_scope != 0) {
+        if (rfid_payload->decrement != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->data_scope > 0) {
-            short t = (short) ((rfid_payload->data_scope + 1) * 2);
+          if (rfid_payload->decrement > 0 && rfid_payload->decrement < 16383) {
+            short t = (short) ((rfid_payload->decrement + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -773,11 +787,11 @@
         }
       break;
       case 9:
-        if (rfid_payload->offset != 0) {
+        if (rfid_payload->data_scope != 0) {
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
-          if (rfid_payload->offset > 0 && rfid_payload->offset < 16383) {
-            short t = (short) ((rfid_payload->offset + 1) * 2);
+          if (rfid_payload->data_scope > 0) {
+            short t = (short) ((rfid_payload->data_scope + 1) * 2);
             buf[ptr ++] = SHORT0(t);
             buf[ptr ++] = SHORT1(t);
           } else {
@@ -790,8 +804,25 @@
         }
       break;
       case 10:
+        if (rfid_payload->offset != 0) {
+          count ++;
+          ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
+          if (rfid_payload->offset > 0 && rfid_payload->offset < 16383) {
+            short t = (short) ((rfid_payload->offset + 1) * 2);
+            buf[ptr ++] = SHORT0(t);
+            buf[ptr ++] = SHORT1(t);
+          } else {
+            buf[ptr ++] = 0;
+            buf[ptr ++] = 0;
+            dtags[* dlen] = 10;
+            (* dlen) ++;
+          }
+          tag = nexttag + 1;
+        }
+      break;
+      case 11:
         if (rfid_payload->data != NULL) {
-          dtags[* dlen] = 10;
+          dtags[* dlen] = 11;
           (* dlen) ++;
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
@@ -800,9 +831,9 @@
           tag = nexttag + 1;
         }
       break;
-      case 11:
+      case 12:
         if (rfid_payload->distribution != NULL) {
-          dtags[* dlen] = 11;
+          dtags[* dlen] = 12;
           (* dlen) ++;
           count ++;
           ptr += tightrope_padding(tag, nexttag, buf + ptr, &count);
@@ -862,11 +893,22 @@
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
+        buf[ptr ++] = 4;
+        buf[ptr ++] = INT0(rfid_payload->duration);
+        buf[ptr ++] = INT1(rfid_payload->duration);
+        buf[ptr ++] = INT2(rfid_payload->duration);
+        buf[ptr ++] = INT3(rfid_payload->duration);
+        break;
+      }
+      case 5: {
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
+        buf[ptr ++] = 0;
         buf[ptr ++] = 1;
         buf[ptr ++] = rfid_payload->door;
         break;
       }
-      case 5: {
+      case 6: {
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
@@ -875,7 +917,7 @@
         buf[ptr ++] = SHORT1(rfid_payload->len);
         break;
       }
-      case 6: {
+      case 7: {
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
@@ -884,7 +926,7 @@
         buf[ptr ++] = SHORT1(rfid_payload->increment);
         break;
       }
-      case 7: {
+      case 8: {
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
@@ -893,7 +935,7 @@
         buf[ptr ++] = SHORT1(rfid_payload->decrement);
         break;
       }
-      case 8: {
+      case 9: {
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
@@ -901,7 +943,7 @@
         buf[ptr ++] = rfid_payload->data_scope;
         break;
       }
-      case 9: {
+      case 10: {
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
         buf[ptr ++] = 0;
@@ -910,7 +952,7 @@
         buf[ptr ++] = SHORT1(rfid_payload->offset);
         break;
       }
-      case 10: {
+      case 11: {
         int size = rfid_payload->__data_len;
         buf[ptr ++] = INT0(size);
         buf[ptr ++] = INT1(size);
@@ -921,7 +963,7 @@
         }
         break;
       }
-      case 11: {
+      case 12: {
         int size = rfid_payload->__distribution_len;
         buf[ptr ++] = INT0(size);
         buf[ptr ++] = INT1(size);
@@ -939,7 +981,7 @@
     return ptr;
   }
   int rfid_payload_encode(rfid_payload_t * rfid_payload, uint8_t * buf) {
-    short dtags[12];
+    short dtags[13];
     int dlen = 0;
     int ptr0 = rfid_payload_set__fields(rfid_payload, buf, dtags, &dlen);
     int ptr1 = rfid_payload_set__data(rfid_payload, buf + ptr0, dtags, dlen);
@@ -955,7 +997,7 @@
   int rfid_payload_estimate_size(uint8_t * buf) {
     int ptr = 0;
     short tag = 0;
-    short dtags[12];
+    short dtags[13];
     int dlen = 0;
     int size = sizeof(rfid_payload_t);
     short count = SHORT(buf);
@@ -991,11 +1033,11 @@
         break;
       }
       case 4: {
-        ptr += 4 + 1;
+        ptr += 4 + 4;
         break;
       }
       case 5: {
-        ptr += 4 + 2;
+        ptr += 4 + 1;
         break;
       }
       case 6: {
@@ -1007,20 +1049,24 @@
         break;
       }
       case 8: {
-        ptr += 4 + 1;
-        break;
-      }
-      case 9: {
         ptr += 4 + 2;
         break;
       }
+      case 9: {
+        ptr += 4 + 1;
+        break;
+      }
       case 10: {
+        ptr += 4 + 2;
+        break;
+      }
+      case 11: {
         int s = INT(buf + ptr);
         ptr += s + 4;
         size += s;
         break;
       }
-      case 11: {
+      case 12: {
         int s = INT(buf + ptr);
         ptr += s + 4;
         size += s;
@@ -1071,20 +1117,23 @@
         rfid_payload->errno = (value >> 1) - 1;
       } else if (tag == 4) {
         tag ++;
-        rfid_payload->door = (value >> 1) - 1;
+        rfid_payload->duration = (value >> 1) - 1;
       } else if (tag == 5) {
         tag ++;
-        rfid_payload->len = (value >> 1) - 1;
+        rfid_payload->door = (value >> 1) - 1;
       } else if (tag == 6) {
         tag ++;
-        rfid_payload->increment = (value >> 1) - 1;
+        rfid_payload->len = (value >> 1) - 1;
       } else if (tag == 7) {
         tag ++;
-        rfid_payload->decrement = (value >> 1) - 1;
+        rfid_payload->increment = (value >> 1) - 1;
       } else if (tag == 8) {
         tag ++;
-        rfid_payload->data_scope = (value >> 1) - 1;
+        rfid_payload->decrement = (value >> 1) - 1;
       } else if (tag == 9) {
+        tag ++;
+        rfid_payload->data_scope = (value >> 1) - 1;
+      } else if (tag == 10) {
         tag ++;
         rfid_payload->offset = (value >> 1) - 1;
       } else {
@@ -1122,39 +1171,45 @@
       }
       case 4: {
         ptr += 4;
-        rfid_payload->door = buf[ptr ++];
+        rfid_payload->duration = INT(buf + ptr);
+        ptr += 4;
         break;
       }
       case 5: {
+        ptr += 4;
+        rfid_payload->door = buf[ptr ++];
+        break;
+      }
+      case 6: {
         ptr += 4;
         rfid_payload->len = SHORT(buf + ptr);
         ptr += 2;
         break;
       }
-      case 6: {
+      case 7: {
         ptr += 4;
         rfid_payload->increment = SHORT(buf + ptr);
         ptr += 2;
         break;
       }
-      case 7: {
+      case 8: {
         ptr += 4;
         rfid_payload->decrement = SHORT(buf + ptr);
         ptr += 2;
         break;
       }
-      case 8: {
+      case 9: {
         ptr += 4;
         rfid_payload->data_scope = buf[ptr ++];
         break;
       }
-      case 9: {
+      case 10: {
         ptr += 4;
         rfid_payload->offset = SHORT(buf + ptr);
         ptr += 2;
         break;
       }
-      case 10: {
+      case 11: {
         int size = INT(buf + ptr);
         ptr += 4;
         rfid_payload->__data_len = size;
@@ -1164,7 +1219,7 @@
         sptr += size;
         break;
       }
-      case 11: {
+      case 12: {
         int size = INT(buf + ptr);
         ptr += 4;
         rfid_payload->__distribution_len = size;
@@ -1185,7 +1240,7 @@
     return ptr;
   }
   int rfid_payload_decode(uint8_t * buf, rfid_payload_t * rfid_payload) {
-    short dtags[12];
+    short dtags[13];
     int dlen = 0;
     int ptr0 = rfid_payload_parse_fields(buf, rfid_payload, dtags, &dlen);
     int ptr1 = rfid_payload_parse_data(buf + ptr0, rfid_payload, dtags, dlen);
