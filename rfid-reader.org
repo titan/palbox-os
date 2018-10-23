@@ -198,8 +198,8 @@
   void rfid_reader_do_action(enum RFID_READER_ACTION action, void * data) {
     uint8_t idx = * (uint8_t *) data;
     switch (action) {
-    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
-      ctxs[idx].retry = 20;
+    case RFID_READER_SET_RETRY_EQUALS_DURATION_DIV_INTERVAL_PLUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
+      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 1;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
       inventory(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
@@ -223,8 +223,8 @@
       console_string(")\r\n");
       break;
     }
-    case RFID_READER_SET_RETRY_EQUALS_10_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
-      ctxs[idx].retry = 20;
+    case RFID_READER_SET_RETRY_EQUALS_DURATION_DIV_INTERVAL_PLUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
+      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 1;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
       difference(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);

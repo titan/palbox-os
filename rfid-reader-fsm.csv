@@ -1,11 +1,11 @@
 state\event,inventory,"inventory ack",difference,"difference ack",data,"data ack","cmd timeout, retry > 0","cmd timeout, retry == 0"
-READY,"set retry = 10
+READY,"set retry = duration div interval plus 1
 set cmd timer
 set activated
 inventory
 ack
 ----
-INVENTORYING",,"set retry = 10
+INVENTORYING",,"set retry = duration div interval plus 1
 set cmd timer
 set activated
 difference
