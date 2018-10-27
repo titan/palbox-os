@@ -171,10 +171,10 @@
               uint8_t byte = 0;
               uint8_t count = 0;
               ring_read(ctx->tx, &byte);
-              while (byte > 127 && ring_length(ctx->tx) > 0) {
-                ring_read(ctx->tx, &byte);
+              while (byte > 0x7F && ring_length(ctx->tx) > 0) {
                 len |= (byte & 0x7F) << (count * 7);
                 count ++;
+                ring_read(ctx->tx, &byte);
               }
               len |= (byte & 0x7F) << (count * 7);
 
@@ -208,12 +208,6 @@
       /* Retrieve the data from the peripheral. */
       data = usart_recv(UART[idx]);
       ring_write(ctx->rx, data);
-      /*
-      if (idx == 3) {
-        console_byte(data);
-        console_char(' ');
-      }
-      */
       if (ring_available(ctx->rx) == 0) {
         /* Disable the RXNEIE interrupt */
         USART_CR1(UART[idx]) &= ~USART_CR1_RXNEIE;
@@ -483,10 +477,11 @@ UART3 总线上以 TDMA 方式运行通讯协议，目标受众是刷卡器，�
         bzero(ebuf##line, elen##line);                                    \
         uint32_t len##line = uart3_packet_encode(packet, ebuf##line, elen##line); \
         elen##line = len##line;                                           \
-        while (elen##line > 0) {                                          \
-          ring_write(tx, elen##line & 0x7F);                              \
+        while (elen##line > 0x7F) {                                       \
+          ring_write(tx, ((elen##line & 0x7F) | 0x80));                   \
           elen##line = elen##line >> 7;                                   \
         }                                                                 \
+        ring_write(tx, elen##line);                                       \
         ring_write_array(tx, ebuf##line, 0, len##line);                   \
       }                                                                   \
     } while (0)
@@ -928,10 +923,11 @@ UART4 总线上运行的是锁控，充电检测和 RFID。锁控系统采用自
         bzero(ebuf##line, elen##line);                                    \
         uint32_t len##line = uart4_packet_encode(packet, ebuf##line, elen##line); \
         elen##line = len##line;                                           \
-        while (elen##line > 0) {                                          \
-          ring_write(tx, elen##line & 0x7F);                              \
+        while (elen##line > 0x7F) {                                       \
+          ring_write(tx, ((elen##line & 0x7F) | 0x80));                   \
           elen##line = elen##line >> 7;                                   \
         }                                                                 \
+        ring_write(tx, elen##line);                                       \
         ring_write_array(tx, ebuf##line, 0, len##line);                   \
       }                                                                   \
     } while (0)

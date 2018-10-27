@@ -240,22 +240,29 @@
     case CONFIRM:
       console_log("CONFIRM of ");
       if (result->parameter.cmd_type == LOCK_DATA) {
-        console_string("LOCK_DATA\r\n");
+        console_string("LOCK_DATA with pin ");
+        console_number(result->parameter.pin & 0xFFFF);
+        console_newline();
         upstream_ack(result->parameter.pin);
       } else if (result->parameter.cmd_type == LOCK_OFF) {
-        console_string("LOCK_OFF\r\n");
+        console_string("LOCK_OFF with pin ");
+        console_number(result->parameter.pin & 0xFFFF);
+        console_newline();
         upstream_ack(result->parameter.pin);
       } else if (result->parameter.cmd_type == EGG_FALLEN) {
-        console_string("EGG_FALLEN\r\n");
+        console_string("EGG_FALLEN with pin ");
+        console_number(result->parameter.pin & 0xFFFF);
+        console_newline();
         upstream_ack(result->parameter.pin);
       } else if (result->parameter.cmd_type == EGG_TIMEOUT) {
-        console_string("EGG_TIMEOUT\r\n");
+        console_string("EGG_TIMEOUT with pin ");
+        console_number(result->parameter.pin & 0xFFFF);
+        console_newline();
         upstream_ack(result->parameter.pin);
-      } else if (result->parameter.cmd_type == RFID_READER_INVENTORY_RESULT) {
-        console_string("RFID_READER_INVENTORY_RESULT\r\n");
-        upstream_ack(result->parameter.pin);
-      } else if (result->parameter.cmd_type == RFID_READER_DIFFERENCE_RESULT) {
-        console_string("RFID_READER_DIFFERENCE_RESULT\r\n");
+      } else if (result->parameter.cmd_type == RFID_READER_DATA) {
+        console_string("RFID_READER_DATA with pin ");
+        console_number(result->parameter.pin & 0xFFFF);
+        console_newline();
         upstream_ack(result->parameter.pin);
       } else {
         console_number(result->parameter.cmd_type);
@@ -600,18 +607,6 @@
       console_string(")\r\n");
       rfid_reader_difference(result->parameter.board, result->parameter.lock, result->parameter.duration, result->parameter.pin);
       break;
-    case RFID_READER_DATA:
-      console_log("RFID_READER_DATA(board: ");
-      console_number(result->parameter.board);
-      console_string(", scope: ");
-      console_number(result->parameter.scope);
-      console_string(", offset: ");
-      console_number(result->parameter.offset);
-      console_string(", num: ");
-      console_number(result->parameter.num);
-      console_string(")\r\n");
-      rfid_reader_data(result->parameter.board, result->parameter.scope, result->parameter.offset, result->parameter.num, result->parameter.pin);
-      break;
     default:
       break;
     }
@@ -672,8 +667,6 @@
     RFID_READER_INVENTORY = 0x22,
     RFID_READER_DIFFERENCE = 0x23,
     RFID_READER_DATA = 0x24,
-    RFID_READER_INVENTORY_RESULT = 0x25,
-    RFID_READER_DIFFERENCE_RESULT = 0x26,
   } cmd_type_t;
 
   typedef struct {

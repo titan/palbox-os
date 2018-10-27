@@ -206,7 +206,7 @@ $(UART4FSMSRC): uart4-fsm.txt | prebuild
 #	sed -i 's/\\n/\\r\\n/g' $@
 $(UPSTREAMFSMSRC): upstream-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix upstream --style table
-#	fsm-generator.py $< -d $(BUILDDIR) --prefix upstreawm --style table --debug
+#	fsm-generator.py $< -d $(BUILDDIR) --prefix upstream --style table --debug
 #	sed -i '1a#include "console.h"' $@
 #	sed -i '1d' $@
 #	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@

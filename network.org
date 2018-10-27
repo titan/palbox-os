@@ -174,6 +174,8 @@
 #+end_src
 #+begin_src c :tangle /dev/shm/boxos/ec20.c
   #include <stddef.h>
+  #include <stdarg.h>
+  #include <string.h>
   #include <libopencm3/stm32/rcc.h>
   #include <libopencm3/stm32/usart.h>
   #include <libopencm3/cm3/nvic.h>
@@ -193,23 +195,20 @@
 
   #define RETRY 10
 
-  #define EC20_BUFFER_BITSIZE 8
-  #define EC20_SEND_BUFFER_BITSIZE 10
+  #define EC20_BUFFER_BITSIZE 10
+  #define EC20_TOKEN_BUFFER_BITSIZE 10
   #define EC20_STACK_BUFFER_BITSIZE 10
 
-  #define ec20_cmd(cmd) do {                                              \
-      ring_write(&ec20_send, sizeof(cmd"\r") - 1);                        \
-      ring_write_array(&ec20_send, (uint8_t *)cmd"\r", 0, sizeof(cmd"\r") - 1); \
-    } while (0)
+  <<ec20-cmd>>
 
   struct ec20_parser_ctx_t {
-    uint8_t token[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
+    uint8_t token[2 << (EC20_TOKEN_BUFFER_BITSIZE - 1)];
     uint8_t ptr;
     uint8_t input;
   };
 
   #define ec20_lex_clear_token(ctx) do {                          \
-      bzero(ctx->token, 2 << (EC20_SEND_BUFFER_BITSIZE - 1));     \
+      bzero(ctx->token, 2 << (EC20_TOKEN_BUFFER_BITSIZE - 1));    \
       ctx->ptr = 0;                                               \
     } while (0)
 
@@ -231,39 +230,19 @@
 
   struct ring_t ec20_tx;
   struct ring_t ec20_rx;
-  static struct ring_t ec20_send;
   static struct stack_t ec20_stack;
   struct ec20_parser_ctx_t ec20_parser_ctx;
 
   static uint8_t ec20_tx_buffer[2 << (EC20_BUFFER_BITSIZE - 1)];
   static uint8_t ec20_rx_buffer[2 << (EC20_BUFFER_BITSIZE - 1)];
-  static uint8_t ec20_send_buffer[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
-  static uint8_t ec20_stack_buffer[2 << (EC20_SEND_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_stack_buffer[2 << (EC20_STACK_BUFFER_BITSIZE - 1)];
 
   static uint8_t ec20_rssi = 0;
   static uint8_t ec20_ber = 0;
   static uint32_t ec20_reset_times = 0;
   static uint32_t ec20_shutdown_times = 0;
 
-  /*
-    send buffer layout:
-
-            +-+-+-+-+-+-+-+-+
-    byte 0  |x|x|x|x|x|x|x|x|   length of data
-            +-+-+-+-+-+-+-+-+
-
-            +-+-+-+-+-+-+-+-+
-    byte 1  |x|x|x|x|x|x|x|x|   data 0
-            +-+-+-+-+-+-+-+-+
-                    .
-                    .
-                    .
-            +-+-+-+-+-+-+-+-+
-    byte n  |x|x|x|x|x|x|x|x|   data m
-            +-+-+-+-+-+-+-+-+
-  ,*/
-
-  volatile uint8_t ec20_length_to_send = 0; // A counter to indicate how many bytes to send to ec20
+  volatile uint32_t ec20_length_to_send = 0; // A counter to indicate how many bytes to send to ec20
   static uint8_t is_online = 0;
   static uint32_t loop_timer = 0;
   static uint32_t tx_timer = 0;
@@ -352,8 +331,7 @@
   void ec20_setup(void) {
     ring_init(&ec20_tx, ec20_tx_buffer, EC20_BUFFER_BITSIZE);
     ring_init(&ec20_rx, ec20_rx_buffer, EC20_BUFFER_BITSIZE + 0);
-    ring_init(&ec20_send, ec20_send_buffer, EC20_SEND_BUFFER_BITSIZE);
-    stack_init(&ec20_stack, ec20_stack_buffer, 2 << (EC20_SEND_BUFFER_BITSIZE - 1));
+    stack_init(&ec20_stack, ec20_stack_buffer, 2 << (EC20_STACK_BUFFER_BITSIZE - 1));
 
     rcc_periph_clock_enable(EC20_RCC_GPIO);
     rcc_periph_clock_enable(EC20_RCC);
@@ -396,22 +374,8 @@
       if (ec20_state == EC20_QIOPEN_OKAY_STATE) {
         if (((systick >> 7) & network_heart_rate) == 5) {
           parameter_t param;
-          bzero(&param, sizeof(parameter_t));
+          init_parameter(&param);
           param.sn = sn ++;
-          param.rssi = ec20_rssi;
-          param.ber = ec20_ber;
-          param.reply_time = network_reply_time;
-          param.ttl = network_ttl;
-          param.network_reset = (int) ec20_reset_times;
-          param.network_shutdown = (int) ec20_shutdown_times;
-          param.fireware_version = (SUB_VERSION << 8) | MAIN_VERSION;
-  #ifdef LOCK_FC
-          param.fireware_version |= (1 << (5 + 16));
-  #endif
-  #ifdef LOCK_DGZL
-          param.fireware_version |= (1 << (4 + 16));
-  #endif
-          param.fireware_version |= (1 << (2 + 16));
           uint8_t pingsize = packet_calculate_encode_size(&param);
           uint8_t buf[pingsize];
           uint8_t bufsize = packet_encode(PING, uid, &param, buf, pingsize);
@@ -504,21 +468,20 @@
       tx_timer = systick + 99; // interval of 100ms
 
       if (ec20_length_to_send == 0) {
-        if (ring_length(&ec20_send) > 1) {
-          uint8_t len = 0;
-          if (ring_at(&ec20_send, 0, &len) == 1) {
-            if (ring_available(&ec20_tx) >= len) {
-              ring_pop(&ec20_send, 1);
-              uint8_t buf[len];
-              if (ring_read_array(&ec20_send, buf, 0, len) != 0) {
-                ring_write_array(&ec20_tx, buf, 0, len);
-                ec20_length_to_send = len;
-                USART_CR1(EC20_USART) |= USART_CR1_TXEIE;
-              }
-            }
+        if (ring_length(&ec20_tx) > 1) {
+          // saved length as varint type
+          uint32_t len = 0;
+          uint8_t byte = 0;
+          uint8_t count = 0;
+          ring_read(&ec20_tx, &byte);
+          while (byte > 0x7F && ring_length(&ec20_tx) > 0) {
+            len |= (byte & 0x7F) << (count * 7);
+            count ++;
+            ring_read(&ec20_tx, &byte);
           }
-        } else {
-          USART_CR1(EC20_USART) &= ~USART_CR1_TXEIE;
+          len |= (byte & 0x7F) << (count * 7);
+          ec20_length_to_send = len;
+          USART_CR1(EC20_USART) |= USART_CR1_TXEIE;
         }
       } else {
         USART_CR1(EC20_USART) |= USART_CR1_TXEIE;
@@ -591,7 +554,6 @@
       ec20_length_to_send = 0;
       ring_empty(&ec20_rx);
       ring_empty(&ec20_tx);
-      ring_empty(&ec20_send);
       stack_clear(&ec20_stack);
       console_log("INITIAL ACTION\r\n");
       break;
@@ -623,8 +585,8 @@
       qiact_timer = systick;
       break;
     case EC20_AT_PLUS_QICSGP_ACTION:
-      //ec20_cmd("AT+QICSGP=1,1,\"" QUOTE(APN) "\"");
-      ec20_cmd("AT+QICSGP=1,1");
+      ec20_cmd("AT+QICSGP=1,1,\"" QUOTE(APN) "\"");
+      //ec20_cmd("AT+QICSGP=1,1");
       qicsgp_timer = systick;
       break;
     case EC20_AT_PLUS_QIOPEN_ACTION:
@@ -1129,35 +1091,65 @@
       uint8_t base64buf[base64_len];
       base64_len = base64_encode(data, size, base64buf, base64_len);
       if (base64_len == 0) return;
-      if (ring_available(&ec20_send) < base64_len * 2 + 17 + 1 /* len of len byte */) {
-        console_log("No enough spaces in ec20_send ringbuffer for ");
-        console_number(base64_len * 2 + 17 + 1);
-        console_string(" bytes\r\n");
-        return;
-      }
-      uint8_t buf[base64_len * 2 + 17 + 1];
-      buf[0] = base64_len * 2 + 17;
-      buf[1] = 'A';
-      buf[2] = 'T';
-      buf[3] = '+';
-      buf[4] = 'Q';
-      buf[5] = 'I';
-      buf[6] = 'S';
-      buf[7] = 'E';
-      buf[8] = 'N';
-      buf[9] = 'D';
-      buf[10] = 'E';
-      buf[11] = 'X';
-      buf[12] = '=';
-      buf[13] = '0';
-      buf[14] = ',';
-      buf[15] = '"';
-      byte2hexstr(buf + 16, base64_len << 1, base64buf, base64_len);
-      buf[15 + base64_len * 2 + 1] = '"';
-      buf[15 + base64_len * 2 + 2] = '\r';
-      ring_write_array(&ec20_send, buf, 0, base64_len * 2 + 17 + 1);
+      uint8_t buf[base64_len * 2 + 1];
+      bzero(buf, base64_len * 2 + 1);
+      byte2hexstr(buf, base64_len << 1, base64buf, base64_len);
+      ec20_cmd("AT+QISENDEX=0,\"", buf, "\"");
     }
   }
+#+end_src
+*** 辅助方法
+**** ec20-cmd
+#+begin_src c :noweb-ref ec20-cmd
+  static uint8_t _ec20_cmd(char * cmd, ...) {
+    uint32_t total = strlen(cmd);
+    char * str = NULL;
+    va_list argptr;
+    va_start(argptr, cmd);
+    do {
+      str = va_arg(argptr, char *);
+      if (str) {
+        total += strlen(str);
+      }
+    } while (str != NULL);
+    va_end(argptr);
+    total += 1; // reversed for '\r'
+
+    uint8_t size = 0;
+
+    if (total < 128) {
+      size = 1;
+    } else if (total < 16384) {
+      size = 2;
+    } else if (total < 2097152) {
+      size = 3;
+    } else {
+      size = 4;
+    }
+    if (total + size <= ring_available(&ec20_tx)) {
+      while (total > 0x7F) {
+        ring_write(&ec20_tx, (total & 0x7F) | 0x80);
+        total >>= 7;
+      }
+      ring_write(&ec20_tx, total);
+
+      ring_write_array(&ec20_tx, (uint8_t *)cmd, 0, strlen(cmd));
+      va_start(argptr, cmd);
+      do {
+        str = va_arg(argptr, char *);
+        if (str) {
+          ring_write_array(&ec20_tx, (uint8_t *)str, 0, strlen(str));
+        }
+      } while (str != NULL);
+      va_end(argptr);
+      ring_write_array(&ec20_tx, (uint8_t *)"\r", 0, 1);
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  #define ec20_cmd(...) _ec20_cmd(__VA_ARGS__, NULL)
 #+end_src
 ** ESP8266
 *** 程序框架
@@ -2055,7 +2047,7 @@
   #define _UPSTREAM_H
 
   #include <stdint.h>
-  #define UPSTREAM_BUFFER_SIZE 128
+  #define UPSTREAM_BUFFER_SIZE 512
 
 
   extern struct ring_t upstream;
@@ -2063,7 +2055,7 @@
   void upstream_setup(void);
   void upstream_eventloop(void);
 
-  void upstream_send(uint16_t pin, uint8_t * buf, uint8_t size);
+  void upstream_send(uint16_t pin, uint8_t * buf, uint32_t size);
   void upstream_ack(uint16_t pin);
 
   #endif
@@ -2080,7 +2072,7 @@
     uint32_t timer;
     uint16_t pin;
     uint8_t retry;
-    uint8_t size;
+    uint32_t size;
     uint8_t buffer[UPSTREAM_BUFFER_SIZE];
   };
 
@@ -2132,6 +2124,11 @@
       ctxs[idx].retry = 3;
       ctxs[idx].timer = systick + 2999;
       network_write(ctxs[idx].buffer, ctxs[idx].size);
+      console_log("upstream write ");
+      console_number(ctxs[idx].size);
+      console_string(" bytes with pin ");
+      console_number(ctxs[idx].pin);
+      console_newline();
       break;
     case UPSTREAM_CLEAR_ACTION:
       activated &= ~(1 << idx);
@@ -2141,13 +2138,18 @@
       ctxs[idx].retry --;
       ctxs[idx].timer = systick + 2999;
       network_write(ctxs[idx].buffer, ctxs[idx].size);
+      console_log("upstream rewrite ");
+      console_number(ctxs[idx].size);
+      console_string(" bytes with pin ");
+      console_number(ctxs[idx].pin);
+      console_newline();
       break;
     }
   }
 #+end_src
 *** 发送数据
 #+begin_src c :noweb-ref upstream-send
-  void upstream_send(uint16_t pin, uint8_t * buf, uint8_t size) {
+  void upstream_send(uint16_t pin, uint8_t * buf, uint32_t size) {
     if (size <= UPSTREAM_BUFFER_SIZE) {
       for (uint8_t i = 0; i < 32; i ++) {
         if ((activated & (1 << i)) == 0) {
@@ -2169,7 +2171,7 @@
 #+begin_src c :noweb-ref upstream-ack
   void upstream_ack(uint16_t pin) {
     for (uint8_t i = 0; i < 32; i ++) {
-      if ((activated & (1 << i)) == 1) {
+      if ((activated & (1 << i)) != 0) {
         if (ctxs[i].pin == pin) {
           activated &= ~(1 << i);
         }

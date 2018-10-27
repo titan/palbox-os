@@ -1,5 +1,12 @@
 #+STARTUP: indent
 * RFID系统
+RFID 系统在接收到网络指令后，下发对应的指令到 RFID 下位机。下位机执行
+完毕，反馈给 RFID 系统。RFID 系统先不把结果返回给网络，而是继续发送读
+取数据的指令给下位机。每读到一批数据，RFID 就往网络上上报一批数据，直
+到全部数据读完。
+
+因为 4G 模块的 sendex 命令有长度限制，因此，每个批次，RFID 系统最多能
+从下位机读 20 个标签数据。
 ** 基本框架
 #+begin_src c :tangle /dev/shm/boxos/rfid-reader.h
   #ifndef _RFID_READER_H
@@ -18,7 +25,6 @@
   void rfid_reader_callback(uart4_packet_t * packet);
   <<inventory-prototype>>
   <<difference-prototype>>
-  <<fetch-data-prototype>>
   #endif
 #+end_src
 #+begin_src c :tangle /dev/shm/boxos/rfid-reader.c
@@ -36,6 +42,9 @@
   #include "ring.h"
   #include "rfid-reader-fsm.h"
 
+  #define MAXTAGS 20
+  #define TAGSIZE 6
+
   <<cmd>>
 
   struct rfid_reader_context {
@@ -46,13 +55,13 @@
     uint32_t duration;
     uint16_t pin;
     uint16_t offset;
-    uint16_t num;
+    uint16_t num; // total number of tags
     uint8_t door;
     uint8_t scope;
     uint16_t increment;
     uint16_t decrement;
-    uint8_t data[1024];
     uint16_t data_len;
+    uint8_t data[MAXTAGS * TAGSIZE];
   };
 
   static struct rfid_reader_context ctxs[MAX_RFID_READERS];
@@ -100,19 +109,7 @@
       loop_timer = systick + 999; // interval of 1 seconds
       for (uint8_t i = 0; i < MAX_RFID_READERS; i ++) {
         if ((activated & (1 << i)) == 0) continue;
-        if (ctxs[i].state == RFID_READER_INVENTORYING_STATE) {
-          if (ctxs[i].retry == 0) {
-            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
-          } else {
-            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
-          }
-        } else if (ctxs[i].state == RFID_READER_DIFFERENCING_STATE) {
-          if (ctxs[i].retry == 0) {
-            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
-          } else {
-            ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_GREATER_THAN_0_EVENT, &i);
-          }
-        } else if (ctxs[i].state == RFID_READER_DATING_STATE) {
+        if (ctxs[i].state != RFID_READER_READY_STATE) {
           if (ctxs[i].retry == 0) {
             ctxs[i].state = rfid_reader_transform_state(ctxs[i].state, RFID_READER_CMD_TIMEOUT_COMMA_RETRY_EQUALS_0_EVENT, &i);
           } else {
@@ -132,7 +129,11 @@
       activated |= 1 << idx;
       ctxs[idx].num = packet->payload.rfid_reader.len;
       ctxs[idx].scope = RFID_READER_ALL_SCOPE;
-      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_ACK_EVENT, &idx);
+      if (ctxs[idx].num > 0) {
+        ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_ACK_WITH_DATA_EVENT, &idx);
+      } else {
+        ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_ACK_WITHOUT_DATA_EVENT, &idx);
+      }
       console_log("rfid inventory response from rfid reader ");
       console_number(packet->devid);
       console_string(", num: ");
@@ -143,10 +144,18 @@
     case RFID_READER_DIFFERENCE_RESPONSE: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].scope = RFID_READER_INCREMENT_SCOPE | RFID_READER_DECREMENT_SCOPE;
       ctxs[idx].increment = packet->payload.rfid_reader.increment;
       ctxs[idx].decrement = packet->payload.rfid_reader.decrement;
-      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_ACK_EVENT, &idx);
+      if (ctxs[idx].increment > 0) {
+        ctxs[idx].scope = RFID_READER_INCREMENT_SCOPE;
+        ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_ACK_WITH_INCREMENT_DATA_EVENT, &idx);
+      } else if (ctxs[idx].decrement > 0) {
+        ctxs[idx].scope = RFID_READER_DECREMENT_SCOPE;
+        ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_ACK_WITH_DECREMENT_DATA_EVENT, &idx);
+      } else {
+        ctxs[idx].scope = RFID_READER_INCREMENT_SCOPE | RFID_READER_DECREMENT_SCOPE;
+        ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_ACK_WITHOUT_DATA_EVENT, &idx);
+      }
       console_log("rfid difference response from rfid reader ");
       console_number(packet->devid);
       console_string(", increment: ");
@@ -159,23 +168,62 @@
     case RFID_READER_DATA_RESPONSE: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].num = packet->payload.rfid_reader.len;
-      ctxs[idx].data_len = packet->payload.rfid_reader.__data_len;
-      memcpy(ctxs[idx].data, packet->payload.rfid_reader.data, ctxs[idx].data_len);
-      ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_EVENT, &idx);
-      console_log("rfid data response from rfid reader ");
-      console_number(packet->devid);
-      console_string(", scope: ");
-      console_number(ctxs[idx].scope);
-      console_string(", data len: ");
-      console_number(ctxs[idx].data_len);
-      console_newline();
+      if (ctxs[idx].offset == packet->payload.rfid_reader.offset) {
+        ctxs[idx].num = packet->payload.rfid_reader.len;
+        uint32_t data_len = packet->payload.rfid_reader.__data_len;
+        memcpy(ctxs[idx].data, packet->payload.rfid_reader.data, data_len);
+        ctxs[idx].data_len = data_len;
+        switch (ctxs[idx].scope) {
+        case RFID_READER_INCREMENT_SCOPE:
+          if (ctxs[idx].offset + (ctxs[idx].data_len / TAGSIZE) >= ctxs[idx].increment) {
+            // no more increment data to fetch
+            // try to fetch decrement
+            if (ctxs[idx].decrement > 0) {
+              ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_DONE_WITH_DECREMENT_DATA_EVENT, &idx);
+            } else {
+              // no more data to fetch
+              ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_DONE_WITHOUT_DECREMENT_DATA_EVENT, &idx);
+            }
+          } else {
+            ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_CONTINUED_EVENT, &idx);
+          }
+          break;
+        case RFID_READER_DECREMENT_SCOPE:
+          if (ctxs[idx].offset + (ctxs[idx].data_len / TAGSIZE) >= ctxs[idx].decrement) {
+            ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_DONE_EVENT, &idx);
+          } else {
+            ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_CONTINUED_EVENT, &idx);
+          }
+          break;
+        default:
+          if (ctxs[idx].num <= (ctxs[idx].data_len / TAGSIZE) + ctxs[idx].offset) {
+            ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_DONE_EVENT, &idx);
+          } else {
+            ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_ACK_COMMA_CONTINUED_EVENT, &idx);
+          }
+          break;
+        }
+        console_log("rfid data response from rfid reader ");
+        console_number(packet->devid);
+        console_string(", scope: ");
+        console_number(ctxs[idx].scope);
+        console_string(", data len: ");
+        console_number(ctxs[idx].data_len);
+        console_newline();
+      } else {
+        console_log("duplicated rfid data response from rfid reader ");
+        console_number(packet->devid);
+        console_string(", scope: ");
+        console_number(ctxs[idx].scope);
+        console_string(", data len: ");
+        console_number(ctxs[idx].data_len);
+        console_newline();
+      }
       break;
     }
     case RFID_READER_ERROR: {
       uint8_t idx = packet->devid - 1;
       activated |= 1 << idx;
-      ctxs[idx].pin = packet->payload.rfid_reader.sn;
       console_log("rfid error ");
       console_number(packet->payload.rfid_reader.sn);
       console_string(" from rfid reader ");
@@ -199,7 +247,14 @@
     uint8_t idx = * (uint8_t *) data;
     switch (action) {
     case RFID_READER_SET_RETRY_EQUALS_DURATION_DIV_INTERVAL_PLUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_INVENTORY_NEWLINE_ACK_ACTION: {
-      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 1;
+      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 3;
+      console_log("retry is ");
+      console_number(ctxs[idx].retry);
+      console_string(", duration is ");
+      console_number(ctxs[idx].duration);
+      console_string(", cmd-interval");
+      console_number(ctxs[idx].cmd_interval);
+      console_newline();
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
       inventory(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
@@ -224,7 +279,7 @@
       break;
     }
     case RFID_READER_SET_RETRY_EQUALS_DURATION_DIV_INTERVAL_PLUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DIFFERENCE_NEWLINE_ACK_ACTION: {
-      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 1;
+      ctxs[idx].retry = ctxs[idx].duration / ctxs[idx].cmd_interval + 3;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       activated |= 1 << idx;
       difference(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
@@ -248,25 +303,21 @@
       console_string(")\r\n");
       break;
     }
-    case RFID_READER_SET_RETRY_EQUALS_3_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_DATA_ACTION:
-      ctxs[idx].retry = 3;
+    case RFID_READER_SET_DATA_PARAMETER_NEWLINE_SET_RETRY_EQUALS_6_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION: {
+      ctxs[idx].offset = 0;
+      ctxs[idx].retry = 6;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
-      activated |= 1 << idx;
-      fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
-      break;
-    case RFID_READER_INVENTORY_RESULT_ACTION: {
-      parameter_t param;
-      init_parameter(&param);
-      param.sn = sn ++;
-      param.board = idx + 1;
-      param.lock = ctxs[idx].door;
-      param.scope = ctxs[idx].scope;
-      param.num = ctxs[idx].num;
-      param.pin = ((idx << 12) | timestamp) & 0xFFFF;
-      uint8_t param_size = packet_calculate_encode_size(&param);
-      uint8_t ebuf[param_size];
-      uint8_t bufsize = packet_encode(RFID_READER_INVENTORY_RESULT, uid, &param, ebuf, param_size);
-      upstream_send(param.pin, ebuf, bufsize);
+      switch (ctxs[idx].scope) {
+      case RFID_READER_INCREMENT_SCOPE:
+        fetch_data(idx + 1, RFID_READER_INCREMENT_SCOPE, ctxs[idx].offset, MIN(ctxs[idx].increment, MAXTAGS), ctxs[idx].pin);
+        break;
+      case RFID_READER_DECREMENT_SCOPE:
+        fetch_data(idx + 1, RFID_READER_DECREMENT_SCOPE, ctxs[idx].offset, MIN(ctxs[idx].decrement, MAXTAGS), ctxs[idx].pin);
+        break;
+      default:
+        fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, MIN(ctxs[idx].num, MAXTAGS), ctxs[idx].pin);
+        break;
+      }
       break;
     }
     case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_INVENTORY_ACTION:
@@ -274,54 +325,89 @@
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       inventory(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       break;
-    case RFID_READER_DIFFERENCE_RESULT_ACTION: {
-      parameter_t param;
-      init_parameter(&param);
-      param.sn = sn ++;
-      param.board = idx + 1;
-      param.lock = ctxs[idx].door;
-      param.scope = ctxs[idx].scope;
-      param.increment = ctxs[idx].increment;
-      param.decrement = ctxs[idx].decrement;
-      param.pin = ((idx << 12) | timestamp) & 0xFFFF;
-      uint8_t param_size = packet_calculate_encode_size(&param);
-      uint8_t ebuf[param_size];
-      uint8_t bufsize = packet_encode(RFID_READER_DIFFERENCE_RESULT, uid, &param, ebuf, param_size);
-      upstream_send(param.pin, ebuf, bufsize);
-      break;
-    }
     case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_DIFFERENCE_ACTION:
       ctxs[idx].retry --;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       difference(idx + 1, ctxs[idx].door, ctxs[idx].duration, ctxs[idx].pin);
       break;
+    case RFID_READER_ACK_DATA_NEWLINE_SET_NEXT_PARAMETER_NEWLINE_SET_RETRY_EQUALS_6_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION:
+    case RFID_READER_ACK_DATA_NEWLINE_SET_DECREMENT_PARAMETER_NEWLINE_SET_RETRY_EQUALS_6_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION:
     case RFID_READER_ACK_DATA_ACTION: {
-      parameter_t confirm;
-      init_parameter(&confirm);
-      confirm.sn = sn ++;
-      confirm.cmd_type = RFID_READER_DATA;
-      confirm.pin = ctxs[idx].pin;
-      confirm.scope = ctxs[idx].scope;
-      confirm.board = idx + 1;
-      confirm.offset = ctxs[idx].offset;
-      confirm.num = ctxs[idx].num;
-      confirm.data = ctxs[idx].data;
-      confirm.__data_len = ctxs[idx].data_len;
-      uint8_t confirm_size = packet_calculate_encode_size(&confirm);
-      uint8_t ebuf[confirm_size];
-      uint8_t bufsize = packet_encode(CONFIRM, uid, &confirm, ebuf, confirm_size);
-      network_write(ebuf, bufsize);
-      console_log("Confirm RFID-READER-DATA(board: ");
+      parameter_t param;
+      init_parameter(&param);
+      param.sn = sn ++;
+      param.pin = ((idx << 12) | timestamp) & 0xFFFF;
+      param.scope = ctxs[idx].scope;
+      param.board = idx + 1;
+      param.lock = ctxs[idx].door;
+      param.offset = ctxs[idx].offset;
+      if (param.scope == RFID_READER_INCREMENT_SCOPE || param.scope == RFID_READER_DECREMENT_SCOPE) {
+        param.increment = ctxs[idx].increment;
+        param.decrement = ctxs[idx].decrement;
+      } else {
+        param.num = ctxs[idx].num;
+      }
+      param.pins = (int16_t *)&ctxs[idx].pin; // hide pin in pins
+      param.__pins_len = 1;
+      param.data = ctxs[idx].data;
+      param.__data_len = ctxs[idx].data_len;
+      uint8_t param_size = packet_calculate_encode_size(&param);
+      uint8_t ebuf[param_size];
+      uint8_t bufsize = packet_encode(RFID_READER_DATA, uid, &param, ebuf, param_size);
+      upstream_send(param.pin, ebuf, bufsize);
+      console_log("RFID-READER-DATA(board: ");
       console_number(idx + 1);
       console_string(", pin: ");
       console_number(ctxs[idx].pin);
+  #ifdef DEBUG
+      switch (param.scope) {
+      case RFID_READER_INCREMENT_SCOPE:
+        console_string(", increment: ");
+        console_number(ctxs[idx].increment);
+        break;
+      case RFID_READER_DECREMENT_SCOPE:
+        console_string(", decrement: ");
+        console_number(ctxs[idx].decrement);
+        break;
+      default:
+        console_string(", num: ");
+        console_number(ctxs[idx].num);
+        break;
+      }
+  #endif
+      console_string(", offset: ");
+      console_number(ctxs[idx].offset);
+      console_string(", data-len: ");
+      console_number(param.__data_len);
       console_string(")\r\n");
+      if (action == RFID_READER_ACK_DATA_NEWLINE_SET_NEXT_PARAMETER_NEWLINE_SET_RETRY_EQUALS_6_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION) {
+        ctxs[idx].offset += ctxs[idx].data_len / TAGSIZE;
+        ctxs[idx].retry = 6;
+        ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+        fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, MIN(ctxs[idx].num - ctxs[idx].offset, MAXTAGS), ctxs[idx].pin);
+      } else if (action == RFID_READER_ACK_DATA_NEWLINE_SET_DECREMENT_PARAMETER_NEWLINE_SET_RETRY_EQUALS_6_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION) {
+        ctxs[idx].offset = 0;
+        ctxs[idx].retry = 6;
+        ctxs[idx].scope = RFID_READER_DECREMENT_SCOPE;
+        ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+        fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, MIN(ctxs[idx].decrement, MAXTAGS), ctxs[idx].pin);
+      }
       break;
     }
-    case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_DATA_ACTION:
+    case RFID_READER_RETRY_MINUS_1_NEWLINE_SET_CMD_TIMER_NEWLINE_FETCH_DATA_ACTION:
       ctxs[idx].retry --;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
-      fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, ctxs[idx].num, ctxs[idx].pin);
+      switch (ctxs[idx].scope) {
+      case RFID_READER_INCREMENT_SCOPE:
+        fetch_data(idx + 1, RFID_READER_INCREMENT_SCOPE, ctxs[idx].offset, MIN(ctxs[idx].increment - ctxs[idx].offset, MAXTAGS), ctxs[idx].pin);
+        break;
+      case RFID_READER_DECREMENT_SCOPE:
+        fetch_data(idx + 1, RFID_READER_DECREMENT_SCOPE, ctxs[idx].offset, MIN(ctxs[idx].decrement - ctxs[idx].offset, MAXTAGS), ctxs[idx].pin);
+        break;
+      default:
+        fetch_data(idx + 1, ctxs[idx].scope, ctxs[idx].offset, MIN(ctxs[idx].num - ctxs[idx].offset, MAXTAGS), ctxs[idx].pin);
+        break;
+      }
       break;
     case RFID_READER_SET_UNACTIVATED_ACTION:
       activated &= ~(1 << idx);
@@ -352,7 +438,7 @@
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
-    ctxs[idx].duration = duration;
+    ctxs[idx].duration = duration != 0? duration: 9999;
     ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_INVENTORY_EVENT, &idx);
   }
 #+end_src
@@ -378,14 +464,11 @@
     uint8_t idx = rfid_reader - 1;
     ctxs[idx].pin = pin;
     ctxs[idx].door = door;
-    ctxs[idx].duration = duration;
+    ctxs[idx].duration = duration != 0? duration: 9999;
     ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DIFFERENCE_EVENT, &idx);
   }
 #+end_src
 *** 获取数据
-#+begin_src c :noweb-ref fetch-data-prototype
-  void rfid_reader_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin);
-#+end_src
 #+begin_src c :noweb-ref fetch-data
   static void fetch_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
     uart4_packet_t packet;
@@ -400,15 +483,6 @@
     packet.payload.rfid_reader.len = num;
     populate_uart4_packet_to_tx(&packet, rfid_reader_tx);
   }
-
-  void rfid_reader_data(uint8_t rfid_reader, uint8_t scope, uint16_t offset, uint16_t num, uint16_t pin) {
-    uint8_t idx = rfid_reader - 1;
-    ctxs[idx].pin = pin;
-    ctxs[idx].scope = scope;
-    ctxs[idx].offset = offset;
-    ctxs[idx].num = num;
-    ctxs[idx].state = rfid_reader_transform_state(ctxs[idx].state, RFID_READER_DATA_EVENT, &idx);
-  }
 #+end_src
 ** 通讯协议
 *** 命令编号
@@ -422,7 +496,6 @@
 | 0x05 | difference-response | 下->上 | 差异响应 |
 | 0x06 | data-request        | 上->下 | 数据请求 |
 | 0x07 | data-response       | 下->上 | 数据请求 |
-
 
 #+begin_src c :noweb-ref cmd
   typedef enum RFID_READER_CMD_TYPE {
