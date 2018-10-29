@@ -42,7 +42,7 @@ RFID 系统在接收到网络指令后，下发对应的指令到 RFID 下位机
   #include "ring.h"
   #include "rfid-reader-fsm.h"
 
-  #define MAXTAGS 20
+  #define MAXTAGS 30
   #define TAGSIZE 6
 
   <<cmd>>
