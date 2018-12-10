@@ -230,23 +230,27 @@
   void charger_do_action(enum CHARGER_ACTION action, void * data) {
     uint8_t idx = * (uint8_t *) data;
     switch (action) {
-    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_STATUS_ACTION:
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_QUERY_STATUS_ACTION:
     case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_PIN_EQUALS_0_NEWLINE_QUERY_STATUS_ACTION:
       ctxs[idx].retry = 2;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       if (action == CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_PIN_EQUALS_0_NEWLINE_QUERY_STATUS_ACTION) {
         ctxs[idx].pin = 0;
+      } else if (action == CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_QUERY_STATUS_ACTION) {
+        activated |= (1 << idx);
       }
       query_status(idx + 1, ctxs[idx].pin);
       break;
-    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_QUERY_CONFIG_ACTION:
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_QUERY_CONFIG_ACTION:
       ctxs[idx].retry = 2;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      activated |= (1 << idx);
       query_config(idx + 1, ctxs[idx].pin);
       break;
-    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_CONFIG_ACTION:
+    case CHARGER_SET_RETRY_EQUALS_2_NEWLINE_SET_CMD_TIMER_NEWLINE_SET_ACTIVATED_NEWLINE_CONFIG_ACTION:
       ctxs[idx].retry = 2;
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
+      activated |= (1 << idx);
       config(idx + 1, ctxs[idx].enable_charging, ctxs[idx].enable_heating, ctxs[idx].pin);
       break;
     case CHARGER_SET_ACTIVATED_NEWLINE_RESET_RETRY_NEWLINE_ACK_QUERY_STATUS_ACTION:
@@ -392,7 +396,7 @@
       ctxs[idx].cmd_timer = systick + ctxs[idx].cmd_interval;
       config(idx + 1, ctxs[idx].enable_charging, ctxs[idx].enable_heating, ctxs[idx].pin);
       break;
-    case CHARGER_CLEAR_CACHE_ACTION:
+    case CHARGER_CLEAR_CACHE_NEWLINE_SET_UNACTIVATED_ACTION:
       plugged[idx] = 0;
       charging[idx] = 0;
       full[idx] = 0;
@@ -403,6 +407,12 @@
       batteries[idx][1] = 0;
       batteries[idx][2] = 0;
       batteries[idx][3] = 0;
+      if (action == CHARGER_CLEAR_CACHE_NEWLINE_SET_UNACTIVATED_ACTION) {
+        activated &= ~(1 << (idx));
+      }
+      break;
+    case CHARGER_SET_UNACTIVATED_ACTION:
+      activated &= ~(1 << (idx));
       break;
     }
   }

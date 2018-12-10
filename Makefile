@@ -14,7 +14,7 @@ EGGSRC:=$(BUILDDIR)/egg.c
 ENGINEERSRC:=$(BUILDDIR)/engineer.c
 LOCKSRC:=$(BUILDDIR)/lock.c
 NETWORKSRC:=$(BUILDDIR)/network.c
-UTILITYSRC:=$(BUILDDIR)/utility.c
+UTILITYSRC:=$(BUILDDIR)/utility.c $(BUILDDIR)/base64.c $(BUILDDIR)/hash.c $(BUILDDIR)/mt19937.c $(BUILDDIR)/ring.c $(BUILDDIR)/stack.c $(BUILDDIR)/defination.h
 
 LEXFSMSRC:=$(BUILDDIR)/at-lex-fsm.c
 CHARGERFSMSRC:=$(BUILDDIR)/charger-fsm.c
@@ -96,118 +96,118 @@ $(NETWORKSRC): network.org | prebuild
 	org-tangle $<
 $(UTILITYSRC): utility.org | prebuild
 	org-tangle $<
-$(LEXFSMSRC): at-lex-fsm.csv | prebuild
+$(LEXFSMSRC): at-lex-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix at-lex --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix at-lex --style table --debug
-#	sed -i '1a#include "console.h"' at-lex-fsm.c
-#	sed -i '1d' at-lex-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' at-lex-fsm.c
-#	sed -i 's/printf/console_string/g' at-lex-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' at-lex-fsm.c
-$(CHARGERFSMSRC): charger-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(CHARGERFSMSRC): charger-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix charger --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix charger --style table --debug
-#	sed -i '1a#include "console.h"' charger-fsm.c
-#	sed -i '1d' charger-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' charger-fsm.c
-#	sed -i 's/printf/console_string/g' charger-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' charger-fsm.c
-$(EC20FSMSRC): ec20-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(EC20FSMSRC): ec20-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix ec20 --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix ec20 --style table --debug
-#	sed -i '1a#include "console.h"' ec20-fsm.c
-#	sed -i '1d' ec20-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' ec20-fsm.c
-#	sed -i 's/printf/console_string/g' ec20-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' ec20-fsm.c
-$(EC20SYNTAXFSMSRC): ec20-syntax-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(EC20SYNTAXFSMSRC): ec20-syntax-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix ec20-syntax --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix ec20-syntax --style table --debug
-#	sed -i '1a#include "console.h"' ec20-syntax-fsm.c
-#	sed -i '1d' ec20-syntax-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' ec20-syntax-fsm.c
-#	sed -i 's/printf/console_string/g' ec20-syntax-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' ec20-syntax-fsm.c
-$(EGGFSMSRC): egg-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(EGGFSMSRC): egg-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix egg --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix egg --style table --debug
-#	sed -i '1a#include "console.h"' egg-fsm.c
-#	sed -i '1d' egg-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' egg-fsm.c
-#	sed -i 's/printf/console_string/g' egg-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' egg-fsm.c
-$(ENGINEERFSMSRC): engineer-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(ENGINEERFSMSRC): engineer-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix engineer --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix engineer --style table --debug
-#	sed -i '1a#include "console.h"' engineer-fsm.c
-#	sed -i '1d' engineer-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' engineer-fsm.c
-#	sed -i 's/printf/console_string/g' engineer-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' engineer-fsm.c
-$(ESP8266FSMSRC): esp8266-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(ESP8266FSMSRC): esp8266-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix esp8266 --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix esp8266 --style table --debug
-#	sed -i '1a#include "console.h"' esp8266-fsm.c
-#	sed -i '1d' esp8266-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' esp8266-fsm.c
-#	sed -i 's/printf/console_string/g' esp8266-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' esp8266-fsm.c
-$(ESP8266SYNTAXFSMSRC): esp8266-syntax-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(ESP8266SYNTAXFSMSRC): esp8266-syntax-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix esp8266-syntax --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix esp8266-syntax --style table --debug
-#	sed -i '1a#include "console.h"' esp8266-syntax-fsm.c
-#	sed -i '1d' esp8266-syntax-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' esp8266-syntax-fsm.c
-#	sed -i 's/printf/console_string/g' esp8266-syntax-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' esp8266-syntax-fsm.c
-$(LOCKBOARDFSMSRC): lockboard-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(LOCKBOARDFSMSRC): lockboard-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix lockboard --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix lockboard --style table --debug
-#	sed -i '1a#include "console.h"' lockboard-fsm.c
-#	sed -i '1d' lockboard-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' lockboard-fsm.c
-#	sed -i 's/printf/console_string/g' lockboard-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' lockboard-fsm.c
-$(LOCKDGZLFSMSRC): lock-dgzl-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(LOCKDGZLFSMSRC): lock-dgzl-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix lock --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix lock --style table --debug
-#	sed -i '1a#include "console.h"' lock-dgzl-fsm.c
-#	sed -i '1d' lock-dgzl-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' lock-dgzl-fsm.c
-#	sed -i 's/printf/console_string/g' lock-dgzl-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' lock-dgzl-fsm.c
-$(LOCKFCFSMSRC): lock-fc-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(LOCKFCFSMSRC): lock-fc-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix lock --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix lock --style table --debug
-#	sed -i '1a#include "console.h"' lock-fc-fsm.c
-#	sed -i '1d' lock-fc-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' lock-fc-fsm.c
-#	sed -i 's/printf/console_string/g' lock-fc-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' lock-fc-fsm.c
-$(UART3FSMSRC): uart3-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(UART3FSMSRC): uart3-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix uart3 --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix uart3 --style table --debug
-#	sed -i '1a#include "console.h"' uart3-fsm.c
-#	sed -i '1d' uart3-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' uart3-fsm.c
-#	sed -i 's/printf/console_string/g' uart3-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' uart3-fsm.c
-$(UART4FSMSRC): uart4-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(UART4FSMSRC): uart4-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix uart4 --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix uart4 --style table --debug
-#	sed -i '1a#include "console.h"' uart4-fsm.c
-#	sed -i '1d' uart4-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' uart4-fsm.c
-#	sed -i 's/printf/console_string/g' uart4-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' uart4-fsm.c
-$(UPSTREAMFSMSRC): upstream-fsm.csv | prebuild
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
+$(UPSTREAMFSMSRC): upstream-fsm.txt | prebuild
 	fsm-generator.py $< -d $(BUILDDIR) --prefix upstream --style table
 #	fsm-generator.py $< -d $(BUILDDIR) --prefix upstreawm --style table --debug
-#	sed -i '1a#include "console.h"' upstreawm-fsm.c
-#	sed -i '1d' upstreawm-fsm.c
-#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' upstreawm-fsm.c
-#	sed -i 's/printf/console_string/g' upstreawm-fsm.c
-#	sed -i 's/\\n/\\r\\n/g' upstreawm-fsm.c
+#	sed -i '1a#include "console.h"' $@
+#	sed -i '1d' $@
+#	sed -i 's/printf(\"(\");/console_log(\"(\");/g' $@
+#	sed -i 's/printf/console_string/g' $@
+#	sed -i 's/\\n/\\r\\n/g' $@
 
 $(CHARGERPROTOSCR): $(CHARGERPROTO) | prebuild
 	tightrope -entity -serial -clang -d $(BUILDDIR) $<
